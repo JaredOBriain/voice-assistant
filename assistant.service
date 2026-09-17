@@ -1,0 +1,26 @@
+[Unit]
+Description=Voice Assistant
+After=network-online.target sound.target bluetooth.target ollama.service
+Wants=network-online.target bluetooth.target
+
+[Service]
+Type=simple
+User=jpie
+Group=jpie
+WorkingDirectory=/home/jpie/voice-assistant
+ExecStartPre=/bin/sleep 10
+ExecStart=/usr/bin/python3 /home/jpie/voice-assistant/assistant.py
+Restart=always
+RestartSec=5
+# Needed for PulseAudio / PipeWire
+Environment=XDG_RUNTIME_DIR=/run/user/1000
+Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
+Environment=PYTHONUNBUFFERED=1
+# Logging
+StandardOutput=journal
+StandardError=journal
+# Give hardware/audio time
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,26 @@
+# User data — regenerated at runtime, never committed
+data/
+
+# Large binaries/models — documented in README, fetched separately
+piper/*
+!piper/.gitkeep
+models/*
+!models/.gitkeep
+
+# Generated assets (beep.wav is auto-created on first run)
+assets/beep.wav
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# OS/editor cruft
+.DS_Store
+*.swp
+
+# Secrets — if you ever add a .env or key file, keep it out of git
+.env
+*.key

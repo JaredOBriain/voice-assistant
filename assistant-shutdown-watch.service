@@ -1,0 +1,12 @@
+[Unit]
+Description=Assistant Shutdown Watchdog
+After=assistant.service
+
+[Service]
+Type=simple
+User=root
+ExecStart=/bin/bash -c 'while true; do if [ -f /tmp/assistant_shutdown ]; then rm /tmp/assistant_shutdown; systemctl poweroff; fi; sleep 1; done'
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

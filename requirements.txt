@@ -1,0 +1,8 @@
+flask
+flask-cors
+vosk
+pyaudio
+numpy
+openwakeword
+onnxruntime
+ollama

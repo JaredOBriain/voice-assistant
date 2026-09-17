@@ -1,0 +1,1706 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+<title>Assistant</title>
+<link href="https://fonts.googleapis.com/css2?family=Share+Tech+Mono&family=Barlow+Condensed:wght@300;400;600;700&display=swap" rel="stylesheet"/>
+<style>
+  :root {
+    --bg:        #0a0c0f;
+    --panel:     #111418;
+    --border:    #1e2530;
+    --accent:    #00e5ff;
+    --accent2:   #ff6b35;
+    --warn:      #ffcc00;
+    --green:     #39ff14;
+    --text:      #c8d4e0;
+    --muted:     #4a5568;
+    --font-mono: 'Share Tech Mono', monospace;
+    --font-ui:   'Barlow Condensed', sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font-ui);
+    height: 100vh;
+    width: 100vw;
+    overflow: hidden;
+    display: grid;
+    grid-template-rows: 48px 1.7fr 1fr;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background-color: var(--border);
+  }
+
+  /* Scanline overlay */
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background: repeating-linear-gradient(
+      0deg,
+      transparent,
+      transparent 2px,
+      rgba(0,0,0,0.08) 2px,
+      rgba(0,0,0,0.08) 4px
+    );
+    pointer-events: none;
+    z-index: 999;
+  }
+
+  /* ── Header ── */
+  header {
+    grid-column: 1 / -1;
+    background: var(--panel);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 0 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .logo {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--accent);
+    letter-spacing: 4px;
+    text-transform: uppercase;
+  }
+
+  .clock {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    color: var(--muted);
+    letter-spacing: 2px;
+  }
+
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--muted);
+    display: inline-block;
+    margin-right: 8px;
+    transition: background 0.3s, box-shadow 0.3s;
+  }
+  .status-dot.active {
+    background: var(--green);
+    box-shadow: 0 0 8px var(--green);
+    animation: pulse 1.5s infinite;
+  }
+  .status-dot.listening {
+    background: var(--accent);
+    box-shadow: 0 0 10px var(--accent);
+    animation: pulse 0.7s infinite;
+  }
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.4; }
+  }
+
+  /* ── Panels ── */
+  .panel {
+    background: var(--panel);
+    display: flex;
+    flex-direction: column;
+    padding: 18px 22px;
+    position: relative;
+    overflow: hidden;
+  }
+
+  .panel-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 3px;
+    color: var(--muted);
+    text-transform: uppercase;
+    margin-bottom: 14px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .panel-label::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border);
+  }
+
+  /* ── Now Playing ── */
+  #panel-now-playing {
+    grid-column: 1;
+    grid-row: 2;
+  }
+
+  .song-title {
+    font-family: var(--font-ui);
+    font-size: 36px;
+    font-weight: 700;
+    color: #fff;
+    letter-spacing: 0.5px;
+    line-height: 1.1;
+    margin-bottom: 6px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .song-idle {
+    font-size: 18px;
+    color: var(--muted);
+    font-weight: 300;
+  }
+
+  .queue-info {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    margin-top: 6px;
+    letter-spacing: 1px;
+  }
+
+  .queue-info span {
+    color: var(--accent);
+  }
+
+  .playback-state {
+    margin-top: auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .state-badge {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 2px;
+    padding: 4px 10px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+    display: none;
+  }
+  .state-badge.show { display: block; }
+  .state-badge.playing { border-color: var(--green); color: var(--green); }
+  .state-badge.paused  { border-color: var(--warn);  color: var(--warn); }
+  .state-badge.looping { border-color: var(--accent2); color: var(--accent2); }
+
+  /* Waveform bars */
+  .waveform {
+    display: flex;
+    align-items: flex-end;
+    gap: 3px;
+    height: 24px;
+    margin-left: auto;
+  }
+  .waveform .bar {
+    width: 3px;
+    background: var(--accent);
+    border-radius: 1px;
+    opacity: 0.3;
+    animation: none;
+    height: 4px;
+    transition: height 0.2s;
+  }
+  .waveform.playing .bar {
+    opacity: 1;
+    animation: wave var(--d, 0.8s) ease-in-out infinite alternate;
+  }
+  .waveform .bar:nth-child(1) { --d: 0.7s; }
+  .waveform .bar:nth-child(2) { --d: 0.5s; }
+  .waveform .bar:nth-child(3) { --d: 0.9s; }
+  .waveform .bar:nth-child(4) { --d: 0.6s; }
+  .waveform .bar:nth-child(5) { --d: 0.8s; }
+  @keyframes wave {
+    from { height: 4px; }
+    to   { height: 22px; }
+  }
+
+  /* ── Volume ── */
+  #panel-volume {
+    grid-column: 2;
+    grid-row: 2;
+  }
+
+  .volume-display {
+    font-family: var(--font-mono);
+    font-size: 62px;
+    color: var(--accent);
+    line-height: 1;
+    margin-bottom: 16px;
+  }
+  .volume-display sup {
+    font-size: 18px;
+    color: var(--muted);
+    vertical-align: super;
+  }
+
+  .vol-btn-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 10px;
+    margin-bottom: 12px;
+  }
+
+  .vol-btn {
+    background: var(--bg);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 20px;
+    height: 52px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    transition: background 0.15s;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .vol-btn:hover  { background: rgba(0,229,255,0.08); }
+  .vol-btn:active { background: rgba(0,229,255,0.18); }
+  .vol-btn .vol-btn-label {
+    font-size: 10px;
+    letter-spacing: 2px;
+  }
+
+  /* ── Listen Button ── */
+  #panel-listen {
+    grid-column: 1;
+    grid-row: 3;
+    align-items: center;
+    justify-content: center;
+  }
+
+  .listen-btn {
+    position: relative;
+    width: 120px; height: 120px;
+    border-radius: 50%;
+    border: 2px solid var(--accent);
+    background: transparent;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 6px;
+    transition: background 0.2s, box-shadow 0.2s;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .listen-btn:hover,
+  .listen-btn:focus {
+    background: rgba(0,229,255,0.06);
+    box-shadow: 0 0 30px rgba(0,229,255,0.2);
+  }
+  .listen-btn.listening {
+    background: rgba(0,229,255,0.12);
+    border-color: var(--accent);
+    box-shadow: 0 0 40px rgba(0,229,255,0.4), inset 0 0 20px rgba(0,229,255,0.1);
+    animation: listenPulse 1s ease-in-out infinite;
+  }
+  @keyframes listenPulse {
+    0%, 100% { box-shadow: 0 0 30px rgba(0,229,255,0.3), inset 0 0 15px rgba(0,229,255,0.1); }
+    50%       { box-shadow: 0 0 60px rgba(0,229,255,0.6), inset 0 0 25px rgba(0,229,255,0.2); }
+  }
+
+  /* Ripple ring */
+  .listen-btn::before,
+  .listen-btn::after {
+    content: '';
+    position: absolute;
+    border-radius: 50%;
+    border: 1px solid var(--accent);
+    opacity: 0;
+  }
+  .listen-btn.listening::before {
+    width: 150px; height: 150px;
+    animation: ripple 1.5s ease-out infinite;
+  }
+  .listen-btn.listening::after {
+    width: 180px; height: 180px;
+    animation: ripple 1.5s ease-out infinite 0.5s;
+  }
+  @keyframes ripple {
+    0%   { opacity: 0.5; transform: scale(0.8); }
+    100% { opacity: 0;   transform: scale(1.2); }
+  }
+
+  .mic-icon {
+    font-size: 32px;
+    line-height: 1;
+    color: var(--accent);
+  }
+  .listen-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 3px;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+
+  /* ── Controls ── */
+  #panel-controls {
+    grid-column: 2;
+    grid-row: 3;
+  }
+
+  .ctrl-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    grid-auto-rows: 44px;
+    gap: 5px;
+    flex: 0 0 auto;
+  }
+
+  .ctrl-btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 8px;
+    letter-spacing: 2px;
+    padding: 7px 4px;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 6px;
+    transition: border-color 0.15s, background 0.15s, color 0.15s;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+    text-transform: uppercase;
+  }
+  .ctrl-btn .icon { font-size: 14px; }
+  .ctrl-btn:hover,
+  .ctrl-btn:focus  { border-color: var(--accent); color: var(--accent); background: rgba(0,229,255,0.04); }
+  .ctrl-btn:active { background: rgba(0,229,255,0.1); }
+  .ctrl-btn.active { border-color: var(--accent2); color: var(--accent2); }
+
+  .bt-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 5px;
+    margin-top: 5px;
+  }
+  .bt-btn {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 2px;
+    padding: 7px 6px;
+    cursor: pointer;
+    text-align: center;
+    text-transform: uppercase;
+    transition: all 0.15s;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .bt-btn:hover  { border-color: var(--accent); color: var(--accent); }
+  .bt-btn.active { border-color: var(--green); color: var(--green); }
+
+  /* ── Search ── */
+  .search-wrap {
+    margin-top: auto;
+    padding-top: 14px;
+    border-top: 1px solid var(--border);
+  }
+
+  .search-row {
+    display: flex;
+    gap: 8px;
+    margin-top: 8px;
+  }
+
+  .search-input {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: #fff;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    letter-spacing: 1px;
+    padding: 10px 16px;
+    outline: none;
+    transition: border-color 0.2s;
+    caret-color: var(--accent);
+  }
+  .search-input::placeholder { color: var(--muted); }
+  .search-input:focus { border-color: var(--accent); }
+
+  .search-btn {
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 2px;
+    padding: 10px 18px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: background 0.15s;
+    white-space: nowrap;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .search-btn:hover  { background: rgba(0,229,255,0.08); }
+  .search-btn:active { background: rgba(0,229,255,0.18); }
+  .search-btn.queue-btn {
+    border-color: var(--accent2);
+    color: var(--accent2);
+  }
+  .search-btn.queue-btn:hover { background: rgba(255,107,53,0.08); }
+
+  /* ── Playlist toolbar ── */
+  .pl-toolbar {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 10px;
+    align-items: center;
+  }
+
+  .pl-select {
+    flex: 1;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 1px;
+    padding: 8px 10px;
+    outline: none;
+    -webkit-appearance: none;
+    appearance: none;
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  .pl-select:focus { border-color: var(--accent); }
+  .pl-select option { background: var(--panel); color: var(--text); }
+
+  .pl-new-btn {
+    background: transparent;
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 2px;
+    padding: 8px 12px;
+    cursor: pointer;
+    white-space: nowrap;
+    text-transform: uppercase;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+    transition: background 0.15s;
+  }
+  .pl-new-btn:hover { background: rgba(0,229,255,0.08); }
+
+  /* ── Shutdown confirm ── */
+  #shutdown-confirm {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.85);
+    z-index: 600;
+    align-items: center;
+    justify-content: center;
+    flex-direction: column;
+    gap: 24px;
+  }
+  #shutdown-confirm.show { display: flex; }
+
+  .shutdown-msg {
+    font-family: var(--font-mono);
+    font-size: 18px;
+    color: #ff3333;
+    letter-spacing: 3px;
+    text-transform: uppercase;
+  }
+
+  .shutdown-msg-sub {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--muted);
+    letter-spacing: 2px;
+  }
+
+  .shutdown-btns {
+    display: flex;
+    gap: 16px;
+    margin-top: 8px;
+  }
+
+  .sd-confirm {
+    background: transparent;
+    border: 1px solid #ff3333;
+    color: #ff3333;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 2px;
+    padding: 14px 32px;
+    cursor: pointer;
+    text-transform: uppercase;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .sd-confirm:hover { background: rgba(255,51,51,0.15); }
+
+  .sd-cancel {
+    background: transparent;
+    border: 1px solid var(--muted);
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    letter-spacing: 2px;
+    padding: 14px 32px;
+    cursor: pointer;
+    text-transform: uppercase;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .sd-cancel:hover { background: rgba(255,255,255,0.05); }
+
+  .shutdown-btn {
+    position: fixed;
+    bottom: 16px;
+    left: 16px;
+    background: transparent;
+    border: 1px solid #ff3333;
+    color: #ff3333;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 2px;
+    padding: 8px 14px;
+    cursor: pointer;
+    text-transform: uppercase;
+    transition: background 0.15s;
+    z-index: 200;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+  }
+  .shutdown-btn:hover { background: rgba(255,51,51,0.1); }
+
+  /* ── Playlist modal ── */
+  #playlist-modal {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.88);
+    z-index: 600;
+    align-items: center;
+    justify-content: center;
+  }
+  #playlist-modal.show { display: flex; }
+
+  .pl-modal-inner {
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    width: 85%;
+    max-width: 720px;
+    max-height: 85vh;
+    display: flex;
+    flex-direction: column;
+    box-shadow: 0 0 40px rgba(0,229,255,0.15);
+  }
+
+  .pl-modal-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .pl-modal-title {
+    font-family: var(--font-mono);
+    font-size: 13px;
+    letter-spacing: 3px;
+    color: var(--accent);
+    text-transform: uppercase;
+  }
+
+  .pl-modal-close {
+    background: transparent;
+    border: 1px solid var(--muted);
+    color: var(--muted);
+    font-family: var(--font-mono);
+    font-size: 9px;
+    letter-spacing: 2px;
+    padding: 6px 12px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+    text-transform: uppercase;
+  }
+  .pl-modal-close:hover { border-color: var(--text); color: var(--text); }
+
+  .pl-song-list {
+    flex: 1;
+    overflow-y: auto;
+    min-height: 120px;
+    max-height: 380px;
+  }
+
+  .pl-song-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 18px;
+    border-bottom: 1px solid var(--border);
+  }
+  .pl-song-item:last-child { border-bottom: none; }
+
+  .pl-song-num {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    color: var(--muted);
+    width: 20px;
+    flex-shrink: 0;
+  }
+
+  .pl-song-name {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .pl-song-del {
+    background: transparent;
+    border: 1px solid #ff3333;
+    color: #ff3333;
+    font-size: 10px;
+    padding: 5px 10px;
+    cursor: pointer;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+    flex-shrink: 0;
+  }
+
+  .pl-empty {
+    font-family: var(--font-mono);
+    font-size: 10px;
+    color: var(--muted);
+    letter-spacing: 2px;
+    text-align: center;
+    padding: 40px 20px;
+  }
+
+  .pl-modal-footer {
+    display: flex;
+    gap: 10px;
+    padding: 14px 18px;
+    border-top: 1px solid var(--border);
+  }
+
+  .pl-modal-btn {
+    flex: 1;
+    background: transparent;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    letter-spacing: 2px;
+    padding: 13px;
+    cursor: pointer;
+    text-transform: uppercase;
+    -webkit-tap-highlight-color: transparent;
+    outline: none;
+    transition: background 0.15s;
+  }
+  .pl-modal-btn.play   { border: 1px solid var(--accent); color: var(--accent); }
+  .pl-modal-btn.play:hover  { background: rgba(0,229,255,0.08); }
+  .pl-modal-btn.delete { border: 1px solid #ff3333; color: #ff3333; }
+  .pl-modal-btn.delete:hover { background: rgba(255,51,51,0.08); }
+
+  /* ── On-screen Keyboard ── */
+  #osk-overlay,
+  #osk-add-overlay,
+  #osk-playlist-overlay {
+    display: none;
+    position: fixed;
+    inset: 0;
+    background: rgba(0,0,0,0.6);
+    z-index: 500;
+    align-items: flex-end;
+    justify-content: center;
+  }
+  #osk-overlay.show,
+  #osk-add-overlay.show,
+  #osk-playlist-overlay.show { display: flex; }
+
+  #osk-add {
+    background: #0d1117;
+    border: 1px solid var(--accent2);
+    border-bottom: none;
+    padding: 16px 14px 20px;
+    width: 100%;
+    max-width: 1024px;
+    box-shadow: 0 -10px 40px rgba(255,107,53,0.15);
+  }
+
+  #osk-add-input-display {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    color: #fff;
+    background: var(--bg);
+    border: 1px solid var(--accent2);
+    padding: 10px 16px;
+    margin-bottom: 12px;
+    min-height: 44px;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .osk-add-action {
+    background: var(--bg);
+    border: 1px solid var(--accent2);
+    color: var(--accent2);
+    border-radius: 2px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    height: 56px;
+    padding: 0 10px;
+    flex: 3;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    letter-spacing: 2px;
+  }
+  .osk-add-action:active { background: rgba(255,107,53,0.2); }
+
+  #osk-pl {
+    background: #0d1117;
+    border: 1px solid var(--accent2);
+    border-bottom: none;
+    padding: 16px 14px 20px;
+    width: 100%;
+    max-width: 1024px;
+    box-shadow: 0 -10px 40px rgba(255,107,53,0.15);
+  }
+
+  #osk-pl-input-display {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    color: #fff;
+    background: var(--bg);
+    border: 1px solid var(--accent2);
+    padding: 10px 16px;
+    margin-bottom: 12px;
+    min-height: 44px;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  .osk-pl-action {
+    background: var(--bg);
+    border: 1px solid var(--accent2);
+    color: var(--accent2);
+    border-radius: 2px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-family: var(--font-mono);
+    font-size: 16px;
+    height: 56px;
+    padding: 0 10px;
+    flex: 3;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    letter-spacing: 2px;
+  }
+  .osk-pl-action:active { background: rgba(255,107,53,0.2); }
+
+  #osk {
+    background: #0d1117;
+    border: 1px solid var(--accent);
+    border-bottom: none;
+    padding: 16px 14px 20px;
+    width: 100%;
+    max-width: 1024px;
+    box-shadow: 0 -10px 40px rgba(0,229,255,0.15);
+  }
+
+  #osk-input-display {
+    font-family: var(--font-mono);
+    font-size: 22px;
+    color: #fff;
+    background: var(--bg);
+    border: 1px solid var(--accent);
+    padding: 10px 16px;
+    margin-bottom: 12px;
+    min-height: 44px;
+    letter-spacing: 1px;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+  }
+
+  #osk-input-display .cursor {
+    display: inline-block;
+    width: 2px;
+    height: 20px;
+    background: var(--accent);
+    animation: blink 1s infinite;
+    vertical-align: middle;
+    flex-shrink: 0;
+  }
+  @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+  .osk-row {
+    display: flex;
+    gap: 8px;
+    margin-bottom: 8px;
+    justify-content: center;
+  }
+
+  .osk-key {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    color: var(--text);
+    font-family: var(--font-mono);
+    font-size: 16px;
+    height: 56px;
+    min-width: 52px;
+    padding: 0 10px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    border-radius: 2px;
+    transition: background 0.1s, border-color 0.1s;
+    user-select: none;
+    -webkit-tap-highlight-color: transparent;
+    flex: 1;
+  }
+  .osk-key:active, .osk-key.pressed {
+    background: rgba(0,229,255,0.2);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .osk-key.wide  { flex: 1.5; }
+  .osk-key.wider { flex: 2; }
+  .osk-key.space { flex: 5; }
+  .osk-key.action {
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .osk-key.cancel {
+    border-color: var(--muted);
+    color: var(--muted);
+  }
+  .osk-key.play-key {
+    border-color: var(--accent);
+    color: var(--accent);
+    flex: 2;
+  }
+  .osk-key.queue-key {
+    border-color: var(--accent2);
+    color: var(--accent2);
+    flex: 2;
+  }
+
+  /* ── Toast ── */
+  #toast {
+    position: fixed;
+    bottom: 24px;
+    left: 50%;
+    transform: translateX(-50%) translateY(20px);
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    color: var(--accent);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    letter-spacing: 2px;
+    padding: 8px 20px;
+    opacity: 0;
+    transition: opacity 0.3s, transform 0.3s;
+    pointer-events: none;
+    z-index: 1000;
+    white-space: nowrap;
+  }
+  #toast.show {
+    opacity: 1;
+    transform: translateX(-50%) translateY(0);
+  }
+</style>
+</head>
+<body>
+
+<!-- Header -->
+<header>
+  <div class="logo"><span class="status-dot" id="status-dot"></span>ASSISTANT</div>
+  <div class="clock" id="clock">--:--:--</div>
+</header>
+
+<!-- Now Playing -->
+<div class="panel" id="panel-now-playing">
+  <div class="panel-label">NOW PLAYING</div>
+  <div class="song-title song-idle" id="song-title">IDLE</div>
+  <div class="queue-info" id="queue-info">QUEUE &mdash; <span id="queue-count">0</span> / 30</div>
+  <div class="playback-state">
+    <div class="state-badge" id="badge-playing">▶ PLAYING</div>
+    <div class="state-badge" id="badge-paused">⏸ PAUSED</div>
+    <div class="state-badge" id="badge-looping">↻ LOOP</div>
+    <div class="waveform" id="waveform">
+      <div class="bar"></div><div class="bar"></div><div class="bar"></div>
+      <div class="bar"></div><div class="bar"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Volume -->
+<div class="panel" id="panel-volume">
+  <div class="panel-label">VOLUME</div>
+  <div class="volume-display"><span id="vol-num">80</span><sup>%</sup></div>
+  <div class="vol-btn-row">
+    <button class="vol-btn" onclick="adjustVolume(-5)">
+      <span>−</span><span class="vol-btn-label">5%</span>
+    </button>
+    <button class="vol-btn" onclick="adjustVolume(5)">
+      <span>+</span><span class="vol-btn-label">5%</span>
+    </button>
+  </div>
+
+  <div class="search-wrap">
+    <div class="pl-toolbar">
+      <select id="pl-select" class="pl-select" onchange="onPlaylistChange()">
+        <option value="">⊞ SEARCH</option>
+      </select>
+      <button class="pl-new-btn" onclick="openOskForPlaylist()">+ NEW</button>
+    </div>
+    <div class="panel-label" id="search-label">SONG SEARCH</div>
+    <input
+      class="search-input"
+      id="search-input"
+      type="text"
+      inputmode="text"
+      autocomplete="off"
+      autocorrect="off"
+      autocapitalize="off"
+      spellcheck="false"
+      placeholder="artist or song name..."
+      readonly
+      onclick="handleInputTap();"
+    />
+    <div class="search-row" id="search-row" style="display:none">
+      <button class="search-btn queue-btn" id="btn-secondary" onclick="secondaryBtnClick()">▶ PLAY LIST</button>
+      <button class="search-btn" id="btn-view-pl" onclick="openPlaylistModal()">≡ VIEW</button>
+    </div>
+  </div>
+</div>
+
+<!-- Listen Button -->
+<div class="panel" id="panel-listen">
+  <div class="panel-label">VOICE INPUT</div>
+  <button class="listen-btn" id="listen-btn" onclick="triggerListen()">
+    <span class="mic-icon">🎙</span>
+    <span class="listen-label" id="listen-label">TAP TO LISTEN</span>
+  </button>
+</div>
+
+<!-- Controls -->
+<div class="panel" id="panel-controls">
+  <div class="panel-label">PLAYBACK</div>
+  <div class="ctrl-grid">
+    <button class="ctrl-btn" onclick="sendCmd('back')">
+      <span class="icon">⏮</span><span>BACK</span>
+    </button>
+    <button class="ctrl-btn" id="btn-pause" onclick="sendCmd('pause_toggle')">
+      <span class="icon" id="pause-icon">⏸</span><span id="pause-label">PAUSE</span>
+    </button>
+    <button class="ctrl-btn" onclick="sendCmd('skip')">
+      <span class="icon">⏭</span><span>SKIP</span>
+    </button>
+    <button class="ctrl-btn" id="btn-loop" onclick="sendCmd('loop_toggle')">
+      <span class="icon">↻</span><span>LOOP</span>
+    </button>
+    <button class="ctrl-btn" onclick="sendCmd('stop')">
+      <span class="icon">⏹</span><span>STOP</span>
+    </button>
+    <button class="ctrl-btn" onclick="sendCmd('reset')">
+      <span class="icon">↺</span><span>RESET</span>
+    </button>
+  </div>
+  <div class="bt-row">
+    <button class="bt-btn" id="btn-speaker" onclick="sendCmd('speaker')">🎤 USB MIC</button>
+    <button class="bt-btn" id="btn-bt"      onclick="sendCmd('bluetooth')">🎧 BT MIC</button>
+  </div>
+</div>
+
+<!-- Toast -->
+<div id="toast"></div>
+
+<script>
+const API = 'http://localhost:5050';
+let pollTimer = null;
+
+// ── Clock ──
+function updateClock() {
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toTimeString().slice(0,8);
+}
+setInterval(updateClock, 1000);
+updateClock();
+
+// ── Toast ──
+function toast(msg) {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => el.classList.remove('show'), 2500);
+}
+
+// ── Volume buttons ──
+const volNum = document.getElementById('vol-num');
+let currentVolume = 80;
+
+function updateVolumeUI(v) {
+  currentVolume = v;
+  volNum.textContent = v;
+}
+
+async function adjustVolume(delta) {
+  const v = Math.max(0, Math.min(100, currentVolume + delta));
+  updateVolumeUI(v);
+  try {
+    await fetch(`${API}/volume`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ volume: v })
+    });
+  } catch(e) { toast('VOLUME ERROR'); }
+}
+
+// ── Listen button ──
+let listening = false;
+
+async function triggerListen() {
+  if (listening) return;
+  listening = true;
+  const btn   = document.getElementById('listen-btn');
+  const label = document.getElementById('listen-label');
+  const dot   = document.getElementById('status-dot');
+  btn.classList.add('listening');
+  label.textContent = 'LISTENING...';
+  dot.classList.add('listening');
+  dot.classList.remove('active');
+  try {
+    await fetch(`${API}/listen`, { method: 'POST' });
+  } catch(e) { toast('LISTEN ERROR'); }
+  // State resets via poll
+  setTimeout(() => {
+    listening = false;
+    btn.classList.remove('listening');
+    label.textContent = 'TAP TO LISTEN';
+    dot.classList.remove('listening');
+  }, 12000);
+}
+
+// ── Playback commands ──
+async function sendCmd(cmd) {
+  try {
+    const res  = await fetch(`${API}/command`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: cmd })
+    });
+    const data = await res.json();
+    if (data.message) toast(data.message.toUpperCase());
+    pollState();
+  } catch(e) { toast('COMMAND ERROR'); }
+}
+
+// ── State polling ──
+async function pollState() {
+  plPollCounter++;
+  if (plPollCounter % 10 === 0) loadPlaylists();
+  try {
+    const res  = await fetch(`${API}/state`);
+    const data = await res.json();
+
+    // Song title
+    const titleEl = document.getElementById('song-title');
+    if (data.current_song) {
+      titleEl.textContent = data.current_song;
+      titleEl.classList.remove('song-idle');
+    } else {
+      titleEl.textContent = 'IDLE';
+      titleEl.classList.add('song-idle');
+    }
+
+    // Queue
+    document.getElementById('queue-count').textContent = data.queue_length || 0;
+
+    // Badges + waveform
+    const waveform = document.getElementById('waveform');
+    document.getElementById('badge-playing').className =
+      'state-badge' + (data.current_song && !data.is_paused ? ' show playing' : '');
+    document.getElementById('badge-paused').className =
+      'state-badge' + (data.is_paused ? ' show paused' : '');
+    document.getElementById('badge-looping').className =
+      'state-badge' + (data.is_looping ? ' show looping' : '');
+    waveform.className = 'waveform' + (data.current_song && !data.is_paused ? ' playing' : '');
+
+    // Status dot
+    const dot = document.getElementById('status-dot');
+    if (!listening) {
+      if (data.current_song && !data.is_paused) {
+        dot.classList.add('active');
+        dot.classList.remove('listening');
+      } else {
+        dot.classList.remove('active', 'listening');
+      }
+    }
+
+    // Pause button
+    document.getElementById('pause-icon').textContent  = data.is_paused ? '▶' : '⏸';
+    document.getElementById('pause-label').textContent = data.is_paused ? 'RESUME' : 'PAUSE';
+
+    // Loop button
+    document.getElementById('btn-loop').className =
+      'ctrl-btn' + (data.is_looping ? ' active' : '');
+
+    // BT buttons
+    document.getElementById('btn-speaker').className =
+      'bt-btn' + (!data.using_bluetooth ? ' active' : '');
+    document.getElementById('btn-bt').className =
+      'bt-btn' + (data.using_bluetooth ? ' active' : '');
+
+    // Volume
+    updateVolumeUI(data.volume || 80);
+
+    // Listening state
+    if (data.is_listening_for_command && !listening) {
+      listening = true;
+      document.getElementById('listen-btn').classList.add('listening');
+      document.getElementById('listen-label').textContent = 'LISTENING...';
+      dot.classList.add('listening');
+    } else if (!data.is_listening_for_command && listening &&
+               document.getElementById('listen-btn').classList.contains('listening')) {
+      listening = false;
+      document.getElementById('listen-btn').classList.remove('listening');
+      document.getElementById('listen-label').textContent = 'TAP TO LISTEN';
+      dot.classList.remove('listening');
+    }
+
+  } catch(e) {
+    // API not reachable yet — silent retry
+  }
+}
+
+setInterval(pollState, 1000);
+pollState();
+loadPlaylists();
+
+// ── Shutdown ──
+function shutdownPrompt() {
+  document.getElementById('shutdown-confirm').classList.add('show');
+}
+
+function shutdownCancel() {
+  document.getElementById('shutdown-confirm').classList.remove('show');
+}
+
+async function shutdownNow() {
+  document.getElementById('shutdown-confirm').classList.remove('show');
+  toast('SHUTTING DOWN...');
+  try {
+    await fetch(`${API}/shutdown`, { method: 'POST' });
+  } catch(e) {
+    // Expected — Pi will stop responding
+  }
+}
+
+// ── On-screen Keyboard ──
+let oskBuffer = '';
+let oskTarget = '';
+
+function updateAllDisplays(text) {
+  document.getElementById('osk-text').textContent     = text;
+  document.getElementById('osk-add-text').textContent = text;
+  document.getElementById('osk-pl-text').textContent  = text;
+}
+
+function oskKey(char) {
+  oskBuffer += char;
+  updateAllDisplays(oskBuffer);
+}
+
+function oskBackspace() {
+  oskBuffer = oskBuffer.slice(0, -1);
+  updateAllDisplays(oskBuffer);
+}
+
+// ── Search keyboard (no playlist selected) ──
+function openOsk() {
+  oskBuffer = '';
+  updateAllDisplays('');
+  document.getElementById('osk-overlay').classList.add('show');
+}
+
+function oskCancel() {
+  oskBuffer = '';
+  updateAllDisplays('');
+  document.getElementById('osk-overlay').classList.remove('show');
+}
+
+function oskPrimary() {
+  const text = oskBuffer.trim();
+  if (!text) return;
+  oskBuffer = ''; updateAllDisplays('');
+  document.getElementById('osk-overlay').classList.remove('show');
+  searchPlay(text);
+}
+
+function oskSecondary() {
+  const text = oskBuffer.trim();
+  if (!text) return;
+  oskBuffer = ''; updateAllDisplays('');
+  document.getElementById('osk-overlay').classList.remove('show');
+  searchQueue(text);
+}
+
+// ── Add-song keyboard (playlist selected) ──
+function openOskForAddSong() {
+  const playlist = document.getElementById('pl-select').value;
+  if (!playlist) return;
+  oskTarget = playlist;
+  oskBuffer = '';
+  updateAllDisplays('');
+  document.getElementById('osk-add-overlay').classList.add('show');
+}
+
+function oskAddCancel() {
+  oskBuffer = ''; updateAllDisplays('');
+  document.getElementById('osk-add-overlay').classList.remove('show');
+}
+
+function oskAddAction() {
+  const text = oskBuffer.trim();
+  if (!text) return;
+  oskBuffer = ''; updateAllDisplays('');
+  document.getElementById('osk-add-overlay').classList.remove('show');
+  addSongToPlaylist(oskTarget, text);
+}
+
+// ── Create-playlist keyboard (+ NEW button) ──
+function openOskForPlaylist() {
+  oskBuffer = '';
+  updateAllDisplays('');
+  document.getElementById('osk-playlist-overlay').classList.add('show');
+}
+
+function oskPlaylistCancel() {
+  oskBuffer = ''; updateAllDisplays('');
+  document.getElementById('osk-playlist-overlay').classList.remove('show');
+}
+
+function oskPlaylistAction() {
+  const text = oskBuffer.trim();
+  if (!text) return;
+  oskBuffer = ''; updateAllDisplays('');
+  document.getElementById('osk-playlist-overlay').classList.remove('show');
+  createPlaylistWithName(text);
+}
+
+// ── handleInputTap routes to the correct keyboard ──
+function handleInputTap() {
+  const playlist = document.getElementById('pl-select').value;
+  if (playlist) openOskForAddSong();
+  else openOsk();
+}
+
+// ── Search ──
+async function searchPlay(song) {
+  if (!song) return;
+  toast('SEARCHING: ' + song.toUpperCase());
+  try {
+    const res  = await fetch(`${API}/command`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'play ' + song })
+    });
+    const data = await res.json();
+    if (data.message) toast(data.message.toUpperCase());
+  } catch(e) { toast('SEARCH ERROR'); }
+}
+
+async function searchQueue(song) {
+  if (!song) return;
+  toast('QUEUEING: ' + song.toUpperCase());
+  try {
+    const res  = await fetch(`${API}/command`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: 'add ' + song })
+    });
+    const data = await res.json();
+    if (data.message) toast(data.message.toUpperCase());
+  } catch(e) { toast('QUEUE ERROR'); }
+}
+
+// ── Playlists ──
+let deleteConfirmPending = false;
+let plPollCounter = 0;
+
+async function loadPlaylists() {
+  try {
+    const res  = await fetch(`${API}/playlists`);
+    const data = await res.json();
+    const select  = document.getElementById('pl-select');
+    const current = select.value;
+    select.innerHTML = '<option value="">⊞ SEARCH</option>';
+    Object.keys(data).forEach(name => {
+      const opt = document.createElement('option');
+      opt.value       = name;
+      opt.textContent = '♫ ' + name.toUpperCase();
+      select.appendChild(opt);
+    });
+    if (current && data[current] !== undefined) select.value = current;
+  } catch(e) {}
+}
+
+function onPlaylistChange() {
+  const playlist  = document.getElementById('pl-select').value;
+  const secondary = document.getElementById('btn-secondary');
+  const searchRow = document.getElementById('search-row');
+  const label     = document.getElementById('search-label');
+  const input     = document.getElementById('search-input');
+  if (playlist) {
+    secondary.textContent    = '▶ PLAY LIST';
+    label.textContent        = 'ADD TO: ' + playlist.toUpperCase();
+    input.placeholder        = 'tap to search song to add...';
+    searchRow.style.display  = '';
+  } else {
+    label.textContent        = 'SONG SEARCH';
+    input.placeholder        = 'artist or song name...';
+    searchRow.style.display  = 'none';
+  }
+}
+
+function secondaryBtnClick() {
+  const playlist = document.getElementById('pl-select').value;
+  if (playlist) playCurrentPlaylist();
+  else openOsk();
+}
+
+async function createPlaylistWithName(name) {
+  try {
+    await fetch(`${API}/playlists/create`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name })
+    });
+    toast('PLAYLIST "' + name.toUpperCase() + '" CREATED');
+    await loadPlaylists();
+    document.getElementById('pl-select').value = name;
+    onPlaylistChange();
+  } catch(e) { toast('ERROR CREATING PLAYLIST'); }
+}
+
+async function addSongToPlaylist(playlist, song) {
+  toast('ADDING "' + song.toUpperCase() + '" TO ' + playlist.toUpperCase());
+  try {
+    await fetch(`${API}/playlists/add_song`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playlist, song })
+    });
+  } catch(e) { toast('ERROR ADDING SONG'); }
+}
+
+async function playCurrentPlaylist() {
+  const playlist = document.getElementById('pl-select').value;
+  if (!playlist) return;
+  try {
+    const res  = await fetch(`${API}/playlists/play`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: playlist })
+    });
+    const data = await res.json();
+    toast(data.ok ? 'PLAYING: ' + playlist.toUpperCase() : 'PLAYLIST IS EMPTY');
+  } catch(e) { toast('ERROR PLAYING PLAYLIST'); }
+}
+
+async function openPlaylistModal() {
+  const playlist = document.getElementById('pl-select').value;
+  if (!playlist) return;
+  deleteConfirmPending = false;
+  document.getElementById('pl-modal-title').textContent = playlist.toUpperCase();
+  document.querySelector('.pl-modal-btn.delete').textContent   = '🗑 DELETE PLAYLIST';
+  document.querySelector('.pl-modal-btn.delete').style.background = '';
+  await refreshPlaylistModal(playlist);
+  document.getElementById('playlist-modal').classList.add('show');
+}
+
+function closePlaylistModal() {
+  document.getElementById('playlist-modal').classList.remove('show');
+  deleteConfirmPending = false;
+}
+
+async function refreshPlaylistModal(playlist) {
+  try {
+    const res   = await fetch(`${API}/playlists`);
+    const data  = await res.json();
+    const songs = data[playlist] || [];
+    const list  = document.getElementById('pl-song-list');
+    if (songs.length === 0) {
+      list.innerHTML = '<div class="pl-empty">NO SONGS IN PLAYLIST</div>';
+      return;
+    }
+    list.innerHTML = songs.map((path, i) => {
+      const name = path.split('/').pop().replace(/\.[^.]+$/, '');
+      const safe = playlist.replace(/'/g, "\\'");
+      return `<div class="pl-song-item">
+        <span class="pl-song-num">${i + 1}.</span>
+        <span class="pl-song-name">${name}</span>
+        <button class="pl-song-del" onclick="removeSong('${safe}', ${i})">✕</button>
+      </div>`;
+    }).join('');
+  } catch(e) {}
+}
+
+async function removeSong(playlist, index) {
+  try {
+    await fetch(`${API}/playlists/remove_song`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ playlist, index })
+    });
+    toast('SONG REMOVED');
+    await refreshPlaylistModal(playlist);
+  } catch(e) { toast('ERROR REMOVING SONG'); }
+}
+
+async function deleteCurrentPlaylist() {
+  const playlist = document.getElementById('pl-select').value;
+  if (!playlist) return;
+  const btn = document.querySelector('.pl-modal-btn.delete');
+  if (!deleteConfirmPending) {
+    deleteConfirmPending = true;
+    btn.textContent       = '⚠ CONFIRM DELETE';
+    btn.style.background  = 'rgba(255,51,51,0.2)';
+    setTimeout(() => {
+      if (deleteConfirmPending) {
+        deleteConfirmPending  = false;
+        btn.textContent       = '🗑 DELETE PLAYLIST';
+        btn.style.background  = '';
+      }
+    }, 3000);
+    return;
+  }
+  deleteConfirmPending = false;
+  try {
+    await fetch(`${API}/playlists/delete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: playlist })
+    });
+    toast('PLAYLIST DELETED');
+    closePlaylistModal();
+    document.getElementById('pl-select').value = '';
+    await loadPlaylists();
+    onPlaylistChange();
+  } catch(e) { toast('ERROR DELETING PLAYLIST'); }
+}
+</script>
+<!-- Shutdown button -->
+<button class="shutdown-btn" onclick="shutdownPrompt()">⏻ SHUTDOWN</button>
+
+<!-- Shutdown confirm dialog -->
+<div id="shutdown-confirm">
+  <div class="shutdown-msg">⚠ SHUTDOWN SYSTEM?</div>
+  <div class="shutdown-msg-sub">THIS WILL STOP THE ASSISTANT AND POWER OFF THE PI</div>
+  <div class="shutdown-btns">
+    <button class="sd-confirm" onclick="shutdownNow()">CONFIRM</button>
+    <button class="sd-cancel" onclick="shutdownCancel()">CANCEL</button>
+  </div>
+</div>
+
+<!-- Playlist Modal -->
+<div id="playlist-modal">
+  <div class="pl-modal-inner">
+    <div class="pl-modal-header">
+      <span class="pl-modal-title" id="pl-modal-title">PLAYLIST</span>
+      <button class="pl-modal-close" onclick="closePlaylistModal()">✕ CLOSE</button>
+    </div>
+    <div class="pl-song-list" id="pl-song-list">
+      <div class="pl-empty">NO SONGS</div>
+    </div>
+    <div class="pl-modal-footer">
+      <button class="pl-modal-btn play" onclick="playCurrentPlaylist()">▶ PLAY PLAYLIST</button>
+      <button class="pl-modal-btn delete" onclick="deleteCurrentPlaylist()">🗑 DELETE PLAYLIST</button>
+    </div>
+  </div>
+</div>
+
+<!-- On-screen Keyboard -->
+<div id="osk-overlay">
+  <div id="osk">
+    <div id="osk-input-display"><span id="osk-text"></span><span class="cursor"></span></div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('q')">q</div>
+      <div class="osk-key" onclick="oskKey('w')">w</div>
+      <div class="osk-key" onclick="oskKey('e')">e</div>
+      <div class="osk-key" onclick="oskKey('r')">r</div>
+      <div class="osk-key" onclick="oskKey('t')">t</div>
+      <div class="osk-key" onclick="oskKey('y')">y</div>
+      <div class="osk-key" onclick="oskKey('u')">u</div>
+      <div class="osk-key" onclick="oskKey('i')">i</div>
+      <div class="osk-key" onclick="oskKey('o')">o</div>
+      <div class="osk-key" onclick="oskKey('p')">p</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('a')">a</div>
+      <div class="osk-key" onclick="oskKey('s')">s</div>
+      <div class="osk-key" onclick="oskKey('d')">d</div>
+      <div class="osk-key" onclick="oskKey('f')">f</div>
+      <div class="osk-key" onclick="oskKey('g')">g</div>
+      <div class="osk-key" onclick="oskKey('h')">h</div>
+      <div class="osk-key" onclick="oskKey('j')">j</div>
+      <div class="osk-key" onclick="oskKey('k')">k</div>
+      <div class="osk-key" onclick="oskKey('l')">l</div>
+      <div class="osk-key wider action" onclick="oskBackspace()">⌫</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('z')">z</div>
+      <div class="osk-key" onclick="oskKey('x')">x</div>
+      <div class="osk-key" onclick="oskKey('c')">c</div>
+      <div class="osk-key" onclick="oskKey('v')">v</div>
+      <div class="osk-key" onclick="oskKey('b')">b</div>
+      <div class="osk-key" onclick="oskKey('n')">n</div>
+      <div class="osk-key" onclick="oskKey('m')">m</div>
+      <div class="osk-key" onclick="oskKey(''')">'</div>
+      <div class="osk-key" onclick="oskKey('-')">-</div>
+      <div class="osk-key wider" onclick="oskKey('1')">1</div>
+      <div class="osk-key" onclick="oskKey('2')">2</div>
+      <div class="osk-key" onclick="oskKey('3')">3</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key cancel wider" onclick="oskCancel()">CANCEL</div>
+      <div class="osk-key space" onclick="oskKey(' ')">SPACE</div>
+      <div class="osk-key play-key" id="osk-btn-primary" onclick="oskPrimary()">▶ PLAY</div>
+      <div class="osk-key queue-key" id="osk-btn-secondary" onclick="oskSecondary()">+ QUEUE</div>
+    </div>
+  </div>
+</div>
+
+<!-- Add-Song Keyboard -->
+<div id="osk-add-overlay">
+  <div id="osk-add">
+    <div id="osk-add-input-display"><span id="osk-add-text"></span><span class="cursor"></span></div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('q')">q</div>
+      <div class="osk-key" onclick="oskKey('w')">w</div>
+      <div class="osk-key" onclick="oskKey('e')">e</div>
+      <div class="osk-key" onclick="oskKey('r')">r</div>
+      <div class="osk-key" onclick="oskKey('t')">t</div>
+      <div class="osk-key" onclick="oskKey('y')">y</div>
+      <div class="osk-key" onclick="oskKey('u')">u</div>
+      <div class="osk-key" onclick="oskKey('i')">i</div>
+      <div class="osk-key" onclick="oskKey('o')">o</div>
+      <div class="osk-key" onclick="oskKey('p')">p</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('a')">a</div>
+      <div class="osk-key" onclick="oskKey('s')">s</div>
+      <div class="osk-key" onclick="oskKey('d')">d</div>
+      <div class="osk-key" onclick="oskKey('f')">f</div>
+      <div class="osk-key" onclick="oskKey('g')">g</div>
+      <div class="osk-key" onclick="oskKey('h')">h</div>
+      <div class="osk-key" onclick="oskKey('j')">j</div>
+      <div class="osk-key" onclick="oskKey('k')">k</div>
+      <div class="osk-key" onclick="oskKey('l')">l</div>
+      <div class="osk-key wider action" onclick="oskBackspace()">⌫</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('z')">z</div>
+      <div class="osk-key" onclick="oskKey('x')">x</div>
+      <div class="osk-key" onclick="oskKey('c')">c</div>
+      <div class="osk-key" onclick="oskKey('v')">v</div>
+      <div class="osk-key" onclick="oskKey('b')">b</div>
+      <div class="osk-key" onclick="oskKey('n')">n</div>
+      <div class="osk-key" onclick="oskKey('m')">m</div>
+      <div class="osk-key" onclick="oskKey('\'')">'</div>
+      <div class="osk-key" onclick="oskKey('-')">-</div>
+      <div class="osk-key wider" onclick="oskKey('1')">1</div>
+      <div class="osk-key" onclick="oskKey('2')">2</div>
+      <div class="osk-key" onclick="oskKey('3')">3</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key cancel wider" onclick="oskAddCancel()">CANCEL</div>
+      <div class="osk-key space" onclick="oskKey(' ')">SPACE</div>
+      <div class="osk-add-action" onclick="oskAddAction()">➕ ADD SONG</div>
+    </div>
+  </div>
+</div>
+
+<!-- Playlist Keyboard -->
+<div id="osk-playlist-overlay">
+  <div id="osk-pl">
+    <div id="osk-pl-input-display"><span id="osk-pl-text"></span><span class="cursor"></span></div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('q')">q</div>
+      <div class="osk-key" onclick="oskKey('w')">w</div>
+      <div class="osk-key" onclick="oskKey('e')">e</div>
+      <div class="osk-key" onclick="oskKey('r')">r</div>
+      <div class="osk-key" onclick="oskKey('t')">t</div>
+      <div class="osk-key" onclick="oskKey('y')">y</div>
+      <div class="osk-key" onclick="oskKey('u')">u</div>
+      <div class="osk-key" onclick="oskKey('i')">i</div>
+      <div class="osk-key" onclick="oskKey('o')">o</div>
+      <div class="osk-key" onclick="oskKey('p')">p</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('a')">a</div>
+      <div class="osk-key" onclick="oskKey('s')">s</div>
+      <div class="osk-key" onclick="oskKey('d')">d</div>
+      <div class="osk-key" onclick="oskKey('f')">f</div>
+      <div class="osk-key" onclick="oskKey('g')">g</div>
+      <div class="osk-key" onclick="oskKey('h')">h</div>
+      <div class="osk-key" onclick="oskKey('j')">j</div>
+      <div class="osk-key" onclick="oskKey('k')">k</div>
+      <div class="osk-key" onclick="oskKey('l')">l</div>
+      <div class="osk-key wider action" onclick="oskBackspace()">⌫</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key" onclick="oskKey('z')">z</div>
+      <div class="osk-key" onclick="oskKey('x')">x</div>
+      <div class="osk-key" onclick="oskKey('c')">c</div>
+      <div class="osk-key" onclick="oskKey('v')">v</div>
+      <div class="osk-key" onclick="oskKey('b')">b</div>
+      <div class="osk-key" onclick="oskKey('n')">n</div>
+      <div class="osk-key" onclick="oskKey('m')">m</div>
+      <div class="osk-key" onclick="oskKey('\'')">'</div>
+      <div class="osk-key" onclick="oskKey('-')">-</div>
+      <div class="osk-key wider" onclick="oskKey('1')">1</div>
+      <div class="osk-key" onclick="oskKey('2')">2</div>
+      <div class="osk-key" onclick="oskKey('3')">3</div>
+    </div>
+    <div class="osk-row">
+      <div class="osk-key cancel wider" onclick="oskPlaylistCancel()">CANCEL</div>
+      <div class="osk-key space" onclick="oskKey(' ')">SPACE</div>
+      <div class="osk-pl-action" id="osk-pl-action-btn" onclick="oskPlaylistAction()">✓ CREATE</div>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>
