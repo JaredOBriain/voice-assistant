@@ -1135,6 +1135,12 @@ def switch_to_speaker():
 COMMAND_RECORDINGS_DIR = os.path.join(BASE_DIR, "data", "command_recordings")
 MAX_COMMAND_RECORDINGS = 30
 
+# Off by default: this writes a wav per command and is a debugging aid, not
+# something to leave running. Set True when a misheard command needs chasing
+# down, then restart the service. /recordings keeps serving whatever is
+# already on disk either way.
+SAVE_COMMAND_RECORDINGS = False
+
 
 def save_command_recording(pcm_bytes, decoded):
     """Keep the audio a command was decoded from, next to what each recogniser
@@ -1144,7 +1150,7 @@ def save_command_recording(pcm_bytes, decoded):
     to the Whisper server, so what's saved is what the server heard. Commands
     that produced nothing are saved too — "it didn't hear me at all" is the
     case most worth having a recording of. Served by /recordings."""
-    if not pcm_bytes:
+    if not SAVE_COMMAND_RECORDINGS or not pcm_bytes:
         return
     try:
         os.makedirs(COMMAND_RECORDINGS_DIR, exist_ok=True)
