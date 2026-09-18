@@ -128,12 +128,34 @@ mode. It talks to the Flask API on `localhost:5050`. There's no build step.
 
 ## Known-fragile areas
 
-- `SILENCE_THRESHOLD` (currently 400) and the 1.5s end-of-speech timing in
-  `listen_for_command()` are tuned by ear for the current mic. Changing mics
-  will likely require re-tuning. Note `is_silent()` only decides *when a
-  command has ended* — every chunk is fed to both recognizers regardless,
-  because ambient cabin noise sits too close to speech level for amplitude
-  alone to safely gate what Vosk hears.
+- **`SILENCE_THRESHOLD`, `MIC_GAIN` and `HIGHPASS_HZ` are one coupled set —
+  never change one alone.** `is_silent()` compares raw mean-abs amplitude
+  against `SILENCE_THRESHOLD` to decide *when a command has ended*, so
+  raising the gain without raising the threshold makes silence look like
+  speech and no command ever finishes before the 10s timeout. The current
+  values are measured, not guessed: after the high-pass and `MIC_GAIN`,
+  silence sits at 636-715 mean-abs and speech at 1160+, so 900 splits them.
+  Re-derive from real captures in `data/command_recordings/` after any
+  change. Note `is_silent()` only gates the end-of-speech timer — every
+  chunk reaches both recognizers regardless, because cabin noise sits too
+  close to speech level for amplitude alone to decide what Vosk hears.
+- The mic feed is high-passed before it is boosted, and the order matters.
+  Captured commands measured ~-22 dBFS peak at 7-9 dB SNR, with the noise
+  dominated by sub-100Hz rumble — 50Hz mains hum sat ~37 dB above the noise
+  median, with harmonics at 100 and 150Hz. That rumble carries no speech but
+  set the peak level, which is why speech was so quiet. Boosting first would
+  simply have amplified the hum and clipped on it. `prepare_mic_audio()`
+  high-passes at 100Hz, then applies `MIC_GAIN`, landing speech near -6 dBFS.
+  Its filter state deliberately carries across chunks and is cleared per
+  capture by `reset_mic_filter()`; restarting the filter every 8000-sample
+  chunk would inject a discontinuity every 167ms.
+- Gain lifts speech *and* noise equally — only the high-pass improves SNR
+  (measured 8.8 -> 11.1 dB on real speech). Don't expect a louder signal to
+  be a cleaner one.
+- The wake-word path does **not** use `prepare_mic_audio()`; it reads the raw
+  stream. That is deliberate — `WAKE_THRESHOLD` is tuned against unprocessed
+  audio, and changing the levels feeding openWakeWord risks reviving the
+  false-trigger problems above.
 - Playlists store absolute paths, but `load_playlists()` rebuilds the
   directory part from the current `MUSIC_FOLDER` on every read, keeping the
   filename as a track's real identity. This is not cosmetic: moving the

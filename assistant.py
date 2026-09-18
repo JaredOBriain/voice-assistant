@@ -12,6 +12,7 @@ import threading
 import sys
 import requests
 import numpy as np
+from scipy.signal import butter, sosfilt
 from collections import deque
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
@@ -298,15 +299,46 @@ def reset_wake_word_state():
     pp.feature_buffer        = oww_blank_feature_buffer.copy()
 
 
-def resample(data):
-    if RESAMPLE_FACTOR == 1:
-        return data
-    audio = np.frombuffer(data, dtype=np.int16)
-    audio = np.clip(audio * 2, -32768, 32767).astype(np.int16)
-    return audio[::RESAMPLE_FACTOR].tobytes()
+# Recorded commands measured at roughly -22 dBFS peak with a 7-9 dB SNR, and
+# the noise was dominated by sub-100Hz rumble: mains hum at 50Hz sat ~37 dB
+# above the noise median, with harmonics at 100 and 150Hz. That rumble carries
+# no speech but sets the peak level, which is why speech ended up so quiet.
+# So: high-pass first, then boost — boosting first would just amplify the hum
+# and clip on it.
+HIGHPASS_HZ = 100   # 4th order, so 50Hz hum lands about 24 dB down
+MIC_GAIN    = 12.0  # raw speech peaks ~1330/32768, so x12 lands near -6 dBFS.
+                    # The old code applied x2 here, so this is 6x louder than before.
+
+_highpass_sos   = butter(4, HIGHPASS_HZ, "highpass", fs=MIC_RATE, output="sos")
+_highpass_state = np.zeros((_highpass_sos.shape[0], 2))
 
 
-SILENCE_THRESHOLD = 400  # mean abs amplitude; tuned by ear for the current mic
+def reset_mic_filter():
+    """Clear the high-pass state between captures, so one command's tail can't
+    ring into the start of the next."""
+    global _highpass_state
+    _highpass_state = np.zeros((_highpass_sos.shape[0], 2))
+
+
+def prepare_mic_audio(data):
+    """High-pass, boost, then decimate a chunk of mic audio to Vosk's rate.
+
+    The filter state carries across calls on purpose: this runs per 8000-sample
+    chunk, and restarting the filter each time would put a discontinuity into
+    the signal every 167ms."""
+    global _highpass_state
+    audio = np.frombuffer(data, dtype=np.int16).astype(np.float32)
+    audio, _highpass_state = sosfilt(_highpass_sos, audio, zi=_highpass_state)
+    audio = np.clip(audio * MIC_GAIN, -32768, 32767).astype(np.int16)
+    return audio[::RESAMPLE_FACTOR].tobytes() if RESAMPLE_FACTOR != 1 else audio.tobytes()
+
+
+# Measured on real captures after the high-pass and MIC_GAIN above: silence
+# sits at 640-715 mean-abs and speech at 1160+, while ambient noise alone
+# reached 787. **Retune this whenever HIGHPASS_HZ or MIC_GAIN changes** — it
+# was 400 for the unfiltered x2 signal, and leaving it there would have made
+# every silence look like speech, so no command would ever end before timeout.
+SILENCE_THRESHOLD = 900
 
 
 def is_silent(data, threshold=SILENCE_THRESHOLD):
@@ -1096,6 +1128,7 @@ def listen_for_command(stream, timeout_seconds=10):
 
     recognizer.Reset()
     recognizer_full.Reset()
+    reset_mic_filter()
 
     decoded = {}  # what each recogniser made of the audio, for the recording
 
@@ -1124,7 +1157,7 @@ def listen_for_command(stream, timeout_seconds=10):
         # for amplitude alone to safely gate what reaches Vosk. is_silent()
         # is used only below, to decide when to start/reset the "how long
         # since we last heard speech" timer that ends the command.
-        data = resample(raw)
+        data = prepare_mic_audio(raw)
         audio_buffer.extend(data)
 
         done_r = recognizer.AcceptWaveform(data)
