@@ -209,6 +209,31 @@ filename containing that word, silently importing an unrelated track.
 Pass a short playlist name if it's going to be used by voice; YouTube
 playlist titles are long, and the voice matcher has to hear the whole thing.
 
+## Diagnosing misheard commands
+
+Every command capture is saved to `data/command_recordings/` as a wav plus a
+json sidecar, and served by the Flask API:
+
+    curl http://localhost:5050/recordings          # newest first, with decodes
+    curl -O http://localhost:5050/recordings/<name>.wav
+
+The wav is the same 16kHz mono PCM `transcribe_remote()` posts to the Whisper
+server, so it is exactly what the server heard — not a re-encode. The sidecar
+records what each recogniser made of that audio (`restricted` from the
+grammar-limited Vosk, `full` from the free one, `remote` from Whisper or null
+when it wasn't consulted, and the `final` chosen text), which is what makes a
+misheard command diagnosable: you can tell a bad recording apart from a good
+recording that was decoded badly.
+
+Captures that decoded to nothing are kept too — "it didn't hear me" is the
+case most worth listening back to. Only the most recent
+`MAX_COMMAND_RECORDINGS` (30) are kept, so the SD card can't fill; at ~10s
+worst case per clip that caps out around 10MB. `data/` is gitignored, so none
+of this is committed.
+
+Note `/recordings/<name>` uses `send_from_directory` deliberately: the API
+listens on `0.0.0.0`, so a hand-joined path would be a traversal hole.
+
 ## Style preferences carried over from earlier sessions
 
 - Prefer surgical, targeted edits over rewriting whole files.

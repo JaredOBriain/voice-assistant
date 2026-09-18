@@ -13,7 +13,7 @@ import sys
 import requests
 import numpy as np
 from collections import deque
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
 # ---------------------------------------------------------------------------
@@ -1013,6 +1013,64 @@ def switch_to_speaker():
 
 
 # ---------------------------------------------------------------------------
+# Command recordings (diagnostics)
+# ---------------------------------------------------------------------------
+
+COMMAND_RECORDINGS_DIR = os.path.join(BASE_DIR, "data", "command_recordings")
+MAX_COMMAND_RECORDINGS = 30
+
+
+def save_command_recording(pcm_bytes, decoded):
+    """Keep the audio a command was decoded from, next to what each recogniser
+    made of it, so a misheard command can actually be listened back to.
+
+    This is the same 16kHz mono PCM that `transcribe_remote()` wraps and posts
+    to the Whisper server, so what's saved is what the server heard. Commands
+    that produced nothing are saved too — "it didn't hear me at all" is the
+    case most worth having a recording of. Served by /recordings."""
+    if not pcm_bytes:
+        return
+    try:
+        os.makedirs(COMMAND_RECORDINGS_DIR, exist_ok=True)
+
+        # finalize() can run more than once inside a single command capture
+        # (it returns early on an empty result and the loop carries on), so
+        # same-second names do collide in practice.
+        stamp = time.strftime("%Y%m%d_%H%M%S")
+        base  = os.path.join(COMMAND_RECORDINGS_DIR, stamp)
+        n = 1
+        while os.path.exists(f"{base}.wav"):
+            n += 1
+            base = os.path.join(COMMAND_RECORDINGS_DIR, f"{stamp}_{n}")
+
+        with wave.open(f"{base}.wav", "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(VOSK_RATE)
+            wf.writeframes(pcm_bytes)
+
+        with open(f"{base}.json", "w") as f:
+            json.dump({
+                "recorded":   time.strftime("%Y-%m-%d %H:%M:%S"),
+                "seconds":    round(len(pcm_bytes) / (VOSK_RATE * 2), 2),
+                "restricted": decoded.get("restricted", ""),
+                "full":       decoded.get("full", ""),
+                "remote":     decoded.get("remote"),
+                "final":      decoded.get("final", ""),
+            }, f, indent=2)
+
+        stems = sorted({os.path.splitext(f)[0] for f in os.listdir(COMMAND_RECORDINGS_DIR)})
+        for old in stems[:-MAX_COMMAND_RECORDINGS]:
+            for ext in (".wav", ".json"):
+                try:
+                    os.remove(os.path.join(COMMAND_RECORDINGS_DIR, old + ext))
+                except OSError:
+                    pass
+    except Exception as e:
+        print(f"Could not save command recording: {e}")
+
+
+# ---------------------------------------------------------------------------
 # Voice recognition
 # ---------------------------------------------------------------------------
 
@@ -1039,14 +1097,19 @@ def listen_for_command(stream, timeout_seconds=10):
     recognizer.Reset()
     recognizer_full.Reset()
 
+    decoded = {}  # what each recogniser made of the audio, for the recording
+
     def finalize():
         r = json.loads(recognizer.FinalResult()).get("text", "").strip()
         f = json.loads(recognizer_full.FinalResult()).get("text", "").strip()
+        remote = None
         if is_name_bearing(r) or is_name_bearing(f):
             remote = transcribe_remote(bytes(audio_buffer))
             if remote:
                 f = remote
-        return choose_command_text(r, f)
+        chosen = choose_command_text(r, f)
+        decoded.update(restricted=r, full=f, remote=remote, final=chosen)
+        return chosen
 
     while is_listening:
         if time.time() - start_time > timeout_seconds:
@@ -1093,6 +1156,7 @@ def listen_for_command(stream, timeout_seconds=10):
             if partial:
                 print(f"Hearing: {partial}    ", end='\r')
 
+    save_command_recording(bytes(audio_buffer), decoded)
     return final_text.strip()
 
 
@@ -1266,6 +1330,35 @@ def api_listen():
     global wake_word_detected
     wake_word_detected = True
     return jsonify({"ok": True})
+
+
+@app.route("/recordings")
+def api_recordings():
+    """Recent command recordings, newest first, each with what was decoded."""
+    if not os.path.isdir(COMMAND_RECORDINGS_DIR):
+        return jsonify([])
+    items = []
+    for wav in sorted(os.listdir(COMMAND_RECORDINGS_DIR), reverse=True):
+        if not wav.endswith(".wav"):
+            continue
+        stem = wav[:-len(".wav")]
+        entry = {"name": wav, "url": f"/recordings/{wav}"}
+        try:
+            with open(os.path.join(COMMAND_RECORDINGS_DIR, stem + ".json")) as f:
+                entry.update(json.load(f))
+        except Exception:
+            pass
+        items.append(entry)
+    return jsonify(items)
+
+
+@app.route("/recordings/<name>")
+def api_recording_file(name):
+    # send_from_directory rejects traversal itself; this API listens on
+    # 0.0.0.0, so the filename must never be joined onto a path by hand.
+    if not name.endswith(".wav"):
+        return jsonify({"error": "not found"}), 404
+    return send_from_directory(COMMAND_RECORDINGS_DIR, name, mimetype="audio/wav")
 
 
 @app.route("/shutdown", methods=["POST"])
