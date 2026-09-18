@@ -77,6 +77,33 @@ earlier fix that was wrongly assumed to have solved it. Always reset via
 `reset_wake_word_state()`, which clears the preprocessor buffers too; don't
 "simplify" it back to a bare `oww_model.reset()`.
 
+**The Bluetooth headset is pinned to HFP, and that costs playback quality
+on purpose.** The Shokz OpenRun gives you *either* 48kHz stereo A2DP
+playback *or* its HFP microphone, never both — classic Bluetooth runs one
+or the other over the link. Worse, the choice is made when the profile
+connects, not when it's switched: once A2DP is connected the mic node is
+never created, and switching the card profile to `headset-head-unit`
+afterwards does not bring it back. Only a reconnect does. Its mic is much
+better than the USB one, so the mic wins; music goes to the JBL car speaker
+(`BT_SPEAKER_SINK`), which does its own 48kHz A2DP.
+
+A2DP outranks HFP on profile priority (18 vs 3) and WirePlumber re-picks by
+priority on every start (`hooks.device.profile.state` is disabled), so
+without help the headset silently connects as a speaker and the assistant
+loses its best mic. `~/.config/wireplumber/wireplumber.conf.d/51-shokz-hfp.conf`
+pins it to `headset-head-unit` by MAC. That file lives outside the repo —
+**on a fresh install it has to be recreated**, or the mic won't be there.
+Nothing in `switch_to_headphones()` / `switch_to_speaker()` may call
+`set-card-profile` on this headset: flipping it to `a2dp-sink` destroys the
+mic node until the next reconnect.
+
+**The headset's PipeWire source name is not stable.** It has appeared as
+both `bluez_input.A8_F5_E1_6A_ED_64.0` and `bluez_input.A8:F5:E1:6A:ED:64`
+(underscores vs colons) across reboots on this same hardware. A hardcoded
+name silently stops matching and the mic switch just fails, so
+`find_bt_mic_source()` resolves it by MAC and accepts either spelling.
+Don't replace it with a constant.
+
 **Voice "stop"/"exit"/"quit"/"goodbye" no longer shut down the assistant.**
 It used to, and "stop" (meaning "stop the music") kept accidentally killing
 the whole process. Voice shutdown is permanently disabled — shutdown only
@@ -118,14 +145,29 @@ mode. It talks to the Flask API on `localhost:5050`. There's no build step.
 - yt-dlp breaks silently when YouTube changes something server-side. If
   songs stop being found with no obvious error, `pip install --upgrade
   yt-dlp --break-system-packages` first, before assuming it's a code bug.
-- PipeWire source/sink names (`TRUST_MIC_SOURCE`, `BT_HEADPHONE_SOURCE`,
-  `BT_SPEAKER_SINK`, `BT_HEADPHONE_CARD`) are hardware-specific strings tied
-  to this exact MAC address / USB device. They will not transfer to
-  different hardware — get current names with `pactl list sources short` /
-  `pactl list sinks short`.
+- PipeWire names (`TRUST_MIC_SOURCE`, `BT_SPEAKER_SINK`) and
+  `BT_HEADPHONE_MAC` are hardware-specific, tied to this exact MAC address /
+  USB device. They will not transfer to different hardware — get current
+  names with `pactl list sources short` / `pactl list sinks short`. The
+  headset's *source* is deliberately not a constant; see
+  `find_bt_mic_source()` above.
+- Adding a second Bluetooth audio device *mid-session* often fails, while
+  both connect fine from a clean boot. Connecting the JBL while the headset
+  already held its HFP link failed every time with bluetoothd logging
+  `a2dp_select_capabilities() Unable to select SEP`, and since the JBL
+  advertises only A2DP it then dropped the connection entirely. The headset
+  hit the same error on its first connect. **Reboot with both devices
+  powered on** rather than debugging it — SCO (headset mic) and A2DP (JBL
+  music) genuinely do run at once once negotiated from scratch.
 - The Bluetooth headphones button is a **mic toggle only**, not an audio
   output switch — this was a deliberate change from an earlier version that
-  switched both mic and speaker output together.
+  switched both mic and speaker output together. It now only moves the
+  default source between the headset and USB mics; it must never touch the
+  headset's card profile.
+- `set_startup_audio_defaults()` prefers the headset mic when its source
+  exists and falls back to the USB mic when it doesn't, so the assistant is
+  never left deaf if the headset is off. That fallback is the only thing
+  keeping voice control alive when the headset's battery dies.
 
 ## Adding music in bulk
 

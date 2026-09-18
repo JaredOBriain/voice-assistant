@@ -54,12 +54,9 @@ MAX_QUEUE        = 30
 # ---------------------------------------------------------------------------
 BT_SPEAKER_SINK = "bluez_output.78_66_F3_2B_B7_E2.1"
 
-BT_HEADPHONE_MAC  = "A8:F5:E1:6A:ED:64"
-BT_HEADPHONE_CARD = "bluez_card.A8_F5_E1_6A_ED_64"
-BT_HEADPHONE_SINK = "bluez_output.A8_F5_E1_6A_ED_64.1"
+BT_HEADPHONE_MAC = "A8:F5:E1:6A:ED:64"
 
-TRUST_MIC_SOURCE    = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
-BT_HEADPHONE_SOURCE = "bluez_input.A8_F5_E1_6A_ED_64.0"
+TRUST_MIC_SOURCE = "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono"
 
 using_bluetooth = False
 
@@ -905,27 +902,51 @@ def handle_break():
 # Bluetooth audio switching
 # ---------------------------------------------------------------------------
 
-def set_startup_audio_defaults():
-    print("Setting startup audio defaults...")
-    try:
-        subprocess.run(["pactl", "set-default-sink",   BT_SPEAKER_SINK],  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        subprocess.run(["pactl", "set-default-source", TRUST_MIC_SOURCE], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        print(f"Sink:   {BT_SPEAKER_SINK}")
-        print(f"Source: {TRUST_MIC_SOURCE}")
-    except Exception as e:
-        print(f"Startup audio error: {e}")
+def find_bt_mic_source():
+    """Resolve the headset's PipeWire source by MAC, or None if absent.
 
-
-def is_headphone_connected():
+    The node name is not stable across reboots — it has appeared as both
+    `bluez_input.A8_F5_E1_6A_ED_64.0` and `bluez_input.A8:F5:E1:6A:ED:64`
+    on this exact hardware, so a hardcoded name silently stops matching and
+    the mic switch fails. Matching on the address covers both spellings.
+    Returning None doubles as the "headset isn't connected" answer, since
+    the source only exists while it is."""
     try:
         result = subprocess.run(
-            ["bluetoothctl", "info", BT_HEADPHONE_MAC],
+            ["pactl", "list", "sources", "short"],
             capture_output=True, text=True, timeout=5
         )
-        return "Connected: yes" in result.stdout
     except Exception as e:
-        print(f"BT check error: {e}")
-        return False
+        print(f"Could not list audio sources: {e}")
+        return None
+
+    wanted = (BT_HEADPHONE_MAC, BT_HEADPHONE_MAC.replace(":", "_"))
+    for line in result.stdout.splitlines():
+        fields = line.split("\t")
+        name = fields[1] if len(fields) > 1 else ""
+        if name.startswith("bluez_input.") and any(mac in name for mac in wanted):
+            return name
+    return None
+
+
+def set_startup_audio_defaults():
+    global using_bluetooth
+    print("Setting startup audio defaults...")
+    try:
+        subprocess.run(["pactl", "set-default-sink", BT_SPEAKER_SINK],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # The headset mic is clearly better than the USB one, so prefer it
+        # whenever the headset is actually connected. If it isn't, its source
+        # doesn't exist and we fall back rather than leaving the assistant deaf.
+        bt_mic = find_bt_mic_source()
+        source = bt_mic or TRUST_MIC_SOURCE
+        subprocess.run(["pactl", "set-default-source", source],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        using_bluetooth = bt_mic is not None
+        print(f"Sink:   {BT_SPEAKER_SINK}")
+        print(f"Source: {source}")
+    except Exception as e:
+        print(f"Startup audio error: {e}")
 
 
 def switch_to_headphones():
@@ -935,24 +956,23 @@ def switch_to_headphones():
         switch_to_speaker()
         return
 
-    if not is_headphone_connected():
+    bt_mic = find_bt_mic_source()
+    if not bt_mic:
         speak_with_piper("Bluetooth headphones are not connected.")
         return
 
     try:
+        # Deliberately no set-card-profile here. The headset's profile is
+        # pinned to HFP by ~/.config/wireplumber/wireplumber.conf.d/
+        # 51-shokz-hfp.conf at connect time, and switching it afterwards does
+        # not bring the mic back anyway — see switch_to_speaker().
         subprocess.run(
-            ["pactl", "set-card-profile", BT_HEADPHONE_CARD, "headset-head-unit"],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        time.sleep(0.5)
-
-        subprocess.run(
-            ["pactl", "set-default-source", BT_HEADPHONE_SOURCE],
+            ["pactl", "set-default-source", bt_mic],
             check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
         using_bluetooth = True
-        print("Switched mic to Bluetooth headset.")
+        print(f"Switched mic to Bluetooth headset ({bt_mic}).")
         speak_with_piper("Switched to headset microphone.")
 
     except subprocess.CalledProcessError as e:
@@ -964,12 +984,13 @@ def switch_to_speaker():
     global using_bluetooth
 
     try:
+        # Only the default source changes. This used to also flip the headset
+        # card to a2dp-sink, which was doubly wrong: the call failed silently
+        # whenever A2DP wasn't on offer (stranding the headset in 16kHz), and
+        # when it did succeed it destroyed the HFP mic node — which does not
+        # come back on switching the profile again, only on a reconnect.
         subprocess.run(
             ["pactl", "set-default-source", TRUST_MIC_SOURCE],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        subprocess.run(
-            ["pactl", "set-card-profile", BT_HEADPHONE_CARD, "a2dp-sink"],
             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
         )
 
