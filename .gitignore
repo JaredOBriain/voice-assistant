@@ -24,3 +24,6 @@ venv/
 # Secrets — if you ever add a .env or key file, keep it out of git
 .env
 *.key
+
+# Diagnostic audio saved by the transcribe server on the home PC
+server/clips/

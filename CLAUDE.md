@@ -43,6 +43,28 @@ Don't reintroduce it as a default value in `assistant.py`. On a fresh
 checkout, create `.env` with `WHISPER_AUTH_TOKEN=<token>`; without it the
 Pi simply falls back to local Vosk for names.
 
+**Noise suppression lives on the server, not the Pi.** The Pi runs Vosk in
+real time and has no CPU to spare, and its restricted-grammar recogniser is
+already the noise-robust path — the weak link is free-text names, which go to
+Whisper anyway. So `transcribe_server.py` denoises (spectral gating via
+`noisereduce`) before transcribing, costing the Pi nothing. `DENOISE_STRENGTH`
+is deliberately below 1.0: gating hard enough to erase the noise also carves
+holes in the speech, and Whisper reads those artefacts as words.
+
+To hear the difference, open **`http://<pc>:5051/`** in a browser on the home
+PC: the server keeps the raw and denoised version of every clip it receives
+(in `server/clips/`, newest 30, gitignored) and lists them side by side with
+players. Only name-bearing commands ever reach the server, so "pause" and
+"skip" will never appear there. `/denoise` and `?denoise=0` also exist for
+scripted A/B, but both are POST-only and need the auth header — they cannot
+be opened in a browser.
+
+If `noisereduce` isn't installed the server transcribes raw audio and says so
+at startup — it must never fail the request, because the Pi would then fall
+back to its much weaker local Vosk transcription. Note denoising adds to the
+server's response time, which is bounded by the Pi's `WHISPER_READ_TIMEOUT`;
+the per-request timing log exists to keep that visible.
+
 **Whisper output is punctuated; the command matchers are not.**
 faster-whisper returns things like `"Play, Bohemian Rhapsody."`, and every
 matcher downstream (`is_play_command`, `extract_song_name`, the `_words()`

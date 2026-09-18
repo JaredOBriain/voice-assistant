@@ -14,6 +14,7 @@ import requests
 import numpy as np
 from scipy.signal import butter, sosfilt
 from collections import deque
+from queue import Queue, Empty
 from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 
@@ -57,6 +58,7 @@ MIC_DEVICE_INDEX = 1
 MIC_RATE         = 48000
 VOSK_RATE        = 16000
 RESAMPLE_FACTOR  = MIC_RATE // VOSK_RATE
+WAKE_CHUNK_16K   = 1280   # openWakeWord's frame size, at VOSK_RATE
 MAX_QUEUE        = 30
 
 # ---------------------------------------------------------------------------
@@ -340,6 +342,11 @@ def prepare_mic_audio(data):
 # every silence look like speech, so no command would ever end before timeout.
 SILENCE_THRESHOLD = 900
 
+# How long the speaker must stay quiet before a command is considered finished.
+# This is now the only thing that ends a command (besides the overall timeout),
+# so lower it if replies feel sluggish — at the cost of clipping slow speech.
+SILENCE_END_SECONDS = 1.5
+
 
 def is_silent(data, threshold=SILENCE_THRESHOLD):
     return np.abs(np.frombuffer(data, dtype=np.int16)).mean() < threshold
@@ -395,6 +402,83 @@ def speak_with_piper(text):
         # itself, so don't start listening again the instant playback ends.
         time.sleep(0.4)
         assistant_speaking.clear()
+
+
+# ---------------------------------------------------------------------------
+# Mic reader thread
+# ---------------------------------------------------------------------------
+# Reading the mic inline between Vosk calls dropped ~20% of every command.
+# Vosk saturates the core for ~65ms per chunk, PipeWire's client thread isn't
+# serviced in time, and those samples are gone — silently, because the reads
+# pass exception_on_overflow=False. Measured 79.7% capture inline against
+# 100% with a thread that does nothing but read. That missing fifth chopped
+# syllables out of the middle of commands, which no amount of gain or
+# denoising downstream can recover.
+AUDIO_CHUNK_FRAMES = WAKE_CHUNK_16K * RESAMPLE_FACTOR  # one wake-word chunk
+AUDIO_QUEUE_MAX    = 40                                # ~3.2s of 48kHz audio
+
+_audio_queue    = Queue(maxsize=AUDIO_QUEUE_MAX)
+_audio_leftover = bytearray()
+_reader_stop    = threading.Event()
+_reader_thread  = None
+
+
+def _audio_reader(stream):
+    while not _reader_stop.is_set():
+        try:
+            chunk = stream.read(AUDIO_CHUNK_FRAMES, exception_on_overflow=False)
+        except Exception as e:
+            print(f"Audio reader error: {e}")
+            time.sleep(0.1)
+            continue
+        if _audio_queue.full():
+            # Nothing is listening right now (TTS, a download, playback), so
+            # drop the oldest chunk rather than grow without bound. The old
+            # code discarded this backlog too, just via PortAudio overruns.
+            try:
+                _audio_queue.get_nowait()
+            except Empty:
+                pass
+        _audio_queue.put(chunk)
+
+
+def start_audio_reader(stream):
+    global _reader_thread
+    _reader_stop.clear()
+    _reader_thread = threading.Thread(target=_audio_reader, args=(stream,), daemon=True)
+    _reader_thread.start()
+
+
+def stop_audio_reader():
+    _reader_stop.set()
+
+
+def drain_audio():
+    """Discard buffered audio so a listen starts from now, not from whatever
+    piled up while the assistant was busy."""
+    _audio_leftover.clear()
+    while True:
+        try:
+            _audio_queue.get_nowait()
+        except Empty:
+            return
+
+
+def read_audio(frames):
+    """Blocking read of `frames` 48kHz frames, assembled from the reader.
+
+    Returns short only when shutting down, which the callers' `while
+    is_listening` guards already handle."""
+    want = frames * 2  # int16
+    while len(_audio_leftover) < want:
+        try:
+            _audio_leftover.extend(_audio_queue.get(timeout=1))
+        except Empty:
+            if _reader_stop.is_set() or not is_listening:
+                break
+    out = bytes(_audio_leftover[:want])
+    del _audio_leftover[:want]
+    return out
 
 
 def open_mic_stream(p, frames_per_buffer=8000):
@@ -1106,17 +1190,11 @@ def save_command_recording(pcm_bytes, decoded):
 # Voice recognition
 # ---------------------------------------------------------------------------
 
-def listen_for_command(stream, timeout_seconds=10):
-    # Reuses the same persistent mic stream as wake-word listening — this
-    # mic can't be opened twice at once (opening a second stream on it
-    # while the first is still held open fails with PortAudio "Device
-    # unavailable" and crashes the process).
-    try:
-        backlog = stream.get_read_available()
-        if backlog > 0:
-            stream.read(backlog, exception_on_overflow=False)
-    except Exception as e:
-        print(f"[DEBUG] could not drain stale audio: {e}")
+def listen_for_command(timeout_seconds=10):
+    # Audio comes from the reader thread, never from the stream directly —
+    # see _audio_reader(). The mic also can't be opened twice at once, so
+    # there is exactly one stream and one reader for the whole process.
+    drain_audio()
 
     print("\nListening for command...")
 
@@ -1131,10 +1209,16 @@ def listen_for_command(stream, timeout_seconds=10):
     reset_mic_filter()
 
     decoded = {}  # what each recogniser made of the audio, for the recording
+    # Vosk finalises a segment whenever AcceptWaveform() returns True, which it
+    # does on any pause mid-phrase. FinalResult() then only returns the last
+    # segment, so segments are collected as they close and joined at the end.
+    parts_r, parts_f = [], []
 
     def finalize():
-        r = json.loads(recognizer.FinalResult()).get("text", "").strip()
-        f = json.loads(recognizer_full.FinalResult()).get("text", "").strip()
+        parts_r.append(json.loads(recognizer.FinalResult()).get("text", "").strip())
+        parts_f.append(json.loads(recognizer_full.FinalResult()).get("text", "").strip())
+        r = " ".join(p for p in parts_r if p).strip()
+        f = " ".join(p for p in parts_f if p).strip()
         remote = None
         if is_name_bearing(r) or is_name_bearing(f):
             remote = transcribe_remote(bytes(audio_buffer))
@@ -1150,7 +1234,9 @@ def listen_for_command(stream, timeout_seconds=10):
             final_text = finalize()
             break
 
-        raw = stream.read(8000, exception_on_overflow=False)
+        raw = read_audio(8000)
+        if not raw:
+            break
 
         # Every chunk is fed to both recognizers regardless of is_silent() —
         # ambient noise here (~200-350) sits too close to actual speech level
@@ -1160,26 +1246,36 @@ def listen_for_command(stream, timeout_seconds=10):
         data = prepare_mic_audio(raw)
         audio_buffer.extend(data)
 
-        done_r = recognizer.AcceptWaveform(data)
-        done_f = recognizer_full.AcceptWaveform(data)
-
-        if done_r or done_f:
-            final_text = finalize()
-            if final_text:
+        # Deliberately no break here. Vosk's endpointing fires on short pauses
+        # inside a phrase, and breaking on it truncated commands: every capture
+        # measured ended with under 0.7s of trailing silence, never reaching the
+        # silence timer below. Collect the closed segment and keep listening —
+        # only silence or the timeout ends a command now.
+        if recognizer.AcceptWaveform(data):
+            segment = json.loads(recognizer.Result()).get("text", "").strip()
+            if segment:
+                parts_r.append(segment)
                 speech_detected = True
-                print(f"Command: {final_text}")
-                break
-            continue
+        if recognizer_full.AcceptWaveform(data):
+            segment = json.loads(recognizer_full.Result()).get("text", "").strip()
+            if segment:
+                parts_f.append(segment)
+                speech_detected = True
 
         partial = json.loads(recognizer_full.PartialResult()).get("partial", "")
         if partial:
             speech_detected = True
 
-        if is_silent(raw):
+        # is_silent() must see the SAME audio SILENCE_THRESHOLD was measured
+        # against, which is the processed signal — not `raw`. Raw sits around
+        # 50-570 mean-abs, permanently under the threshold, so testing it made
+        # every chunk look silent and cut the speaker off 1.5s after they
+        # started talking.
+        if is_silent(data):
             if speech_detected:
                 if silence_start is None:
                     silence_start = time.time()
-                elif time.time() - silence_start > 1.5:
+                elif time.time() - silence_start > SILENCE_END_SECONDS:
                     final_text = finalize()
                     if final_text:
                         print(f"Command: {final_text}")
@@ -1191,9 +1287,6 @@ def listen_for_command(stream, timeout_seconds=10):
 
     save_command_recording(bytes(audio_buffer), decoded)
     return final_text.strip()
-
-
-WAKE_CHUNK_16K = 1280
 
 
 def open_wake_word_stream():
@@ -1213,20 +1306,13 @@ def open_wake_word_stream():
     return p, stream, read_size
 
 
-def listen_for_wake_word(stream, read_size):
+def listen_for_wake_word(read_size):
     global wake_word_detected
 
-    # The stream keeps running (and PipeWire keeps buffering audio into it)
-    # the whole time we're off doing command handling / TTS / playback, not
-    # just while this function's loop is active. Drain whatever piled up
-    # since we last read, so we don't process a backlog of stale audio as
-    # if it just happened.
-    try:
-        backlog = stream.get_read_available()
-        if backlog > 0:
-            stream.read(backlog, exception_on_overflow=False)
-    except Exception as e:
-        print(f"[DEBUG] could not drain stale audio: {e}")
+    # The reader thread keeps filling the queue the whole time we're off
+    # handling a command, speaking or playing music. Drop that backlog so we
+    # don't process stale audio as if it had just been spoken.
+    drain_audio()
 
     reset_wake_word_state()
 
@@ -1236,7 +1322,9 @@ def listen_for_wake_word(stream, read_size):
         if wake_word_detected:
             break
         try:
-            raw = stream.read(read_size, exception_on_overflow=False)
+            raw = read_audio(read_size)
+            if not raw:
+                continue
 
             if assistant_speaking.is_set():
                 # Drain the stream but don't let the assistant hear itself.
@@ -1558,11 +1646,12 @@ def main():
     script_running = True
 
     wake_p, wake_stream, wake_read_size = open_wake_word_stream()
+    start_audio_reader(wake_stream)
 
     try:
         while script_running:
             wake_word_detected = False
-            listen_for_wake_word(wake_stream, wake_read_size)
+            listen_for_wake_word(wake_read_size)
 
             if not script_running or not is_listening:
                 break
@@ -1574,7 +1663,7 @@ def main():
             time.sleep(0.3)
             play_beep()
             is_listening_for_command = True
-            command = listen_for_command(wake_stream, timeout_seconds=10)
+            command = listen_for_command(timeout_seconds=10)
             is_listening_for_command = False
 
             if not command:
@@ -1648,6 +1737,7 @@ def main():
         stop_music()
         is_listening   = False
         script_running = False
+        stop_audio_reader()
         wake_stream.stop_stream()
         wake_stream.close()
         wake_p.terminate()
