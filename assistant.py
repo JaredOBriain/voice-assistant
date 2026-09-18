@@ -34,6 +34,15 @@ MUSIC_FOLDER    = os.path.join(BASE_DIR, "data", "Music")
 PLAYLIST_FILE   = os.path.join(BASE_DIR, "data", "playlists.json")
 YTDLP_PATH      = "/home/jpie/.local/bin/yt-dlp"
 
+# yt-dlp needs a JavaScript runtime to solve YouTube's signature challenges.
+# Without one it silently falls back to clients like visionos/m3u8 whose URLs
+# mostly answer "HTTP Error 403: Forbidden", so songs fail to download for no
+# visible reason. Only deno is enabled by default and it isn't packaged for
+# Debian; node is, but at 20.x it's below yt-dlp's required 22.0.0. quickjs
+# is in Debian main (2025.04.26, min is 2023.12.09) and is the lightest
+# option, so it's what the Pi uses: sudo apt install quickjs
+YTDLP_JS_RUNTIME = ["--js-runtimes", "quickjs"]
+
 # ---------------------------------------------------------------------------
 # openWakeWord (fully offline, open source, no account needed)
 # ---------------------------------------------------------------------------
@@ -604,6 +613,7 @@ def download_from_youtube(song_name):
         result = subprocess.run(
             [
                 YTDLP_PATH,
+                *YTDLP_JS_RUNTIME,
                 "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
                 "--output", output_template,
                 "--no-playlist", "--match-filter", "duration < 600",

@@ -145,6 +145,22 @@ mode. It talks to the Flask API on `localhost:5050`. There's no build step.
 - yt-dlp breaks silently when YouTube changes something server-side. If
   songs stop being found with no obvious error, `pip install --upgrade
   yt-dlp --break-system-packages` first, before assuming it's a code bug.
+- **yt-dlp needs a JavaScript runtime, and the Pi uses quickjs.** Without
+  one, yt-dlp can't solve YouTube's signature challenges, quietly falls back
+  to clients like `visionos`/`m3u8`, and most downloads die on
+  `HTTP Error 403: Forbidden` — intermittently, which makes it look like a
+  network problem rather than a missing dependency. Only `deno` is enabled
+  by default and it isn't packaged for Debian; `nodejs` is, but trixie ships
+  20.x and yt-dlp requires >= 22.0.0 (it logs
+  `JS runtimes: node-20.19.2 (unsupported)`). quickjs is in Debian main at
+  2025.04.26 against a 2023.12.09 minimum, so: `sudo apt install quickjs`.
+  `YTDLP_JS_RUNTIME` in `assistant.py` carries the flag and is shared with
+  `import_playlist.py` — every yt-dlp invocation must include it, since the
+  runtime is not picked up automatically. Diagnose with
+  `yt-dlp -v ... 2>&1 | grep "JS runtimes:"`.
+- Never run `apt autoremove` on this Pi. It considers the kernel headers and
+  several GNOME menu packages to be orphans and will happily remove them.
+  Remove packages by name instead.
 - PipeWire names (`TRUST_MIC_SOURCE`, `BT_SPEAKER_SINK`) and
   `BT_HEADPHONE_MAC` are hardware-specific, tied to this exact MAC address /
   USB device. They will not transfer to different hardware — get current

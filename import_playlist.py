@@ -20,6 +20,7 @@ import tempfile
 
 from assistant import (
     MUSIC_FOLDER,
+    YTDLP_JS_RUNTIME,
     YTDLP_PATH,
     find_song_in_library,
     load_playlists,
@@ -32,7 +33,8 @@ MAX_TRACK_SECONDS = 900  # skip hour-long DJ sets / full-album uploads
 def probe_playlist(url):
     """Playlist title and track titles, without downloading anything."""
     result = subprocess.run(
-        [YTDLP_PATH, "--flat-playlist", "--print", "%(playlist_title)s\t%(title)s", url],
+        [YTDLP_PATH, *YTDLP_JS_RUNTIME, "--flat-playlist",
+         "--print", "%(playlist_title)s\t%(title)s", url],
         capture_output=True, text=True,
     )
     if result.returncode != 0:
@@ -59,6 +61,7 @@ def download_playlist(url, path_file):
     rather than the .webm/.m4a ones it downloaded first."""
     subprocess.run([
         YTDLP_PATH, url,
+        *YTDLP_JS_RUNTIME,
         "--yes-playlist",
         "--ignore-errors",  # one private/deleted video shouldn't sink the import
         "--extract-audio", "--audio-format", "mp3", "--audio-quality", "0",
