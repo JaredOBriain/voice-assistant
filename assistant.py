@@ -1,13 +1,16 @@
 import ollama
 import subprocess
 import os
+import re
 import time
 import signal
 import json
 import wave
+import io
 import pyaudio
 import threading
 import sys
+import requests
 import numpy as np
 from collections import deque
 from flask import Flask, jsonify, request
@@ -30,11 +33,6 @@ PIPER_PATH      = os.path.join(BASE_DIR, "piper", "piper")
 MUSIC_FOLDER    = os.path.join(BASE_DIR, "data", "Music")
 PLAYLIST_FILE   = os.path.join(BASE_DIR, "data", "playlists.json")
 YTDLP_PATH      = "/home/jpie/.local/bin/yt-dlp"
-
-# ---------------------------------------------------------------------------
-# Wake word
-# ---------------------------------------------------------------------------
-WAKE_WORDS = ["assistant"]
 
 # ---------------------------------------------------------------------------
 # openWakeWord (fully offline, open source, no account needed)
@@ -66,14 +64,33 @@ BT_HEADPHONE_SOURCE = "bluez_input.A8_F5_E1_6A_ED_64.0"
 using_bluetooth = False
 
 # ---------------------------------------------------------------------------
+# Remote transcription (home PC, over Tailscale)
+# ---------------------------------------------------------------------------
+# Offloads only the free-text half of command recognition (song/album/
+# playlist names — see is_name_bearing()) to a faster-whisper server on the
+# home PC. Local Vosk is the automatic fallback if this is unreachable or
+# too slow; see finalize() in listen_for_command().
+WHISPER_SERVER_URL      = "http://100.71.69.96:5051/transcribe"  # Tailscale IP, update after setup
+WHISPER_AUTH_TOKEN      = os.environ.get("WHISPER_AUTH_TOKEN", "")  # from .env via the service; never hardcode it
+WHISPER_CONNECT_TIMEOUT = 3   # fail fast if unreachable (no signal / PC off)
+WHISPER_READ_TIMEOUT    = 20  # medium.en on CPU int8 takes ~15s; small.en fit in 10s
+
+# ---------------------------------------------------------------------------
 # Global state
 # ---------------------------------------------------------------------------
 music_lock = threading.Lock()
+
+# Set while speak_with_piper() is actively playing audio, so the wake-word
+# listener can ignore the assistant's own voice coming back through the mic
+# (there's no acoustic echo cancellation in this pipeline).
+assistant_speaking = threading.Event()
 
 vosk_model           = None
 recognizer           = None
 recognizer_full      = None
 oww_model            = None
+oww_wakeword_key     = None
+oww_blank_feature_buffer = None
 is_listening         = False
 wake_word_detected   = False
 conversation_history = []
@@ -87,7 +104,7 @@ is_paused     = False
 is_looping    = False
 music_thread  = None
 is_listening_for_command = False
-current_volume           = 80
+current_volume           = 20
 
 
 # ---------------------------------------------------------------------------
@@ -157,6 +174,19 @@ def initialize_vosk():
     print("Vosk loaded (restricted + full recognizers).")
 
 
+NAME_BEARING_PREFIXES = (
+    "play album", "add album", "album",
+    "add to queue", "add",
+    "playlist",
+    "play me", "play", "put on",
+    "i want to hear", "i want to listen to",
+)
+
+
+def is_name_bearing(text):
+    return any(text.startswith(prefix) for prefix in NAME_BEARING_PREFIXES)
+
+
 def choose_command_text(restricted, full):
     """Pick the best transcription. The restricted recognizer reliably detects
     the command word even in noise. If that command carries a free-text name
@@ -166,34 +196,100 @@ def choose_command_text(restricted, full):
     full       = (full or "").strip()
     if not restricted:
         return full
-    name_bearing = (
-        "play album", "add album", "album",
-        "add to queue", "add",
-        "playlist",
-        "play me", "play", "put on",
-        "i want to hear", "i want to listen to",
-    )
-    for prefix in name_bearing:
-        if restricted.startswith(prefix):
-            return full if full else restricted
+    if is_name_bearing(restricted):
+        return full if full else restricted
     return restricted
 
 
-def initialize_openwakeword():
-    global oww_model
-    from openwakeword.model import Model
-    import openwakeword
-    # One-time model download (safe to call repeatedly; no-op once cached)
+def strip_punctuation(text):
+    """Whisper punctuates and capitalises what it hears ("Play, Bohemian
+    Rhapsody."), but every matcher downstream works on bare words — an
+    inserted comma alone is enough to stop "play, x" matching the "play "
+    prefix, so the command falls through to "Sorry, I didn't catch that".
+    Apostrophes survive because song titles genuinely contain them
+    ("Livin' On A Prayer")."""
+    text = re.sub(r"[^\w\s']", " ", text)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def transcribe_remote(pcm_bytes):
+    """Send buffered 16kHz mono int16 audio to the home PC's faster-whisper
+    server. Returns the transcribed text, or None if unreachable/failed —
+    callers should fall back to the local Vosk transcription in that case."""
+    wav_buffer = io.BytesIO()
+    with wave.open(wav_buffer, "wb") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(VOSK_RATE)
+        wf.writeframes(pcm_bytes)
+
     try:
-        openwakeword.utils.download_models()
+        response = requests.post(
+            WHISPER_SERVER_URL,
+            data=wav_buffer.getvalue(),
+            headers={"X-Auth-Token": WHISPER_AUTH_TOKEN},
+            timeout=(WHISPER_CONNECT_TIMEOUT, WHISPER_READ_TIMEOUT),
+        )
+        response.raise_for_status()
+        text = strip_punctuation(response.json().get("text", ""))
+        print(f"Remote transcription: {text!r}")
+        return text or None
     except Exception as e:
-        print(f"Model download note: {e}")
+        print(f"Remote transcription unavailable, using local result ({e})")
+        return None
+
+
+def initialize_openwakeword():
+    global oww_model, oww_wakeword_key, oww_blank_feature_buffer
+    from openwakeword.model import Model
+    import openwakeword, glob
+
+    # openwakeword>=0.4 ships pretrained models inside the package itself
+    # (no download step) and Model() now takes explicit file paths rather
+    # than model names. It keys predictions by filename-minus-extension
+    # (e.g. "hey_jarvis_v0.1"), not the bare OWW_MODEL_NAME, so that key
+    # has to be derived from the resolved path rather than assumed.
+    resources_dir = os.path.join(os.path.dirname(openwakeword.__file__), "resources", "models")
+    matches = glob.glob(os.path.join(resources_dir, f"{OWW_MODEL_NAME}_*.onnx"))
+    if not matches:
+        print(f"openWakeWord model files for '{OWW_MODEL_NAME}' not found in {resources_dir}")
+        sys.exit(1)
+
     try:
-        oww_model = Model(wakeword_models=[OWW_MODEL_NAME], inference_framework="onnx")
+        oww_model = Model(wakeword_model_paths=[matches[0]])
+        oww_wakeword_key = os.path.basename(matches[0])[:-len(".onnx")]
+        # Model.reset() (openwakeword 0.4.0) only clears the prediction
+        # smoothing buffer — it does NOT clear preprocessor.raw_data_buffer,
+        # .melspectrogram_buffer or .feature_buffer, which hold up to ~10s of
+        # audio/embedding history (see openwakeword/utils.py AudioFeatures).
+        # Caching a blank feature buffer here lets reset_wake_word_state()
+        # restore that history to empty cheaply, without recomputing it.
+        oww_blank_feature_buffer = oww_model.preprocessor._get_embeddings(
+            np.zeros(160000).astype(np.int16)
+        )
         print(f"openWakeWord loaded. Wake word: '{OWW_MODEL_NAME.replace('_', ' ')}'")
     except Exception as e:
         print(f"openWakeWord init failed: {e}")
         sys.exit(1)
+
+
+def reset_wake_word_state():
+    """Fully clear openWakeWord's state between listening sessions.
+
+    oww_model.reset() alone leaves ~10s of stale raw audio / melspectrogram /
+    embedding history sitting in oww_model.preprocessor. That history still
+    contains the embeddings for the "hey jarvis" utterance that just got
+    detected, so the very next listen_for_wake_word() call could see a high
+    score again within its first few chunks — a second, spurious detection
+    from the same utterance, not a real new one. This mirrors what
+    AudioFeatures.__init__ sets up, so the preprocessor starts genuinely
+    blank instead of just "unscored"."""
+    oww_model.reset()
+    pp = oww_model.preprocessor
+    pp.raw_data_buffer.clear()
+    pp.accumulated_samples   = 0
+    pp.melspectrogram_buffer = np.ones((76, 32))
+    pp.feature_buffer        = oww_blank_feature_buffer.copy()
 
 
 def resample(data):
@@ -204,7 +300,10 @@ def resample(data):
     return audio[::RESAMPLE_FACTOR].tobytes()
 
 
-def is_silent(data, threshold=50):
+SILENCE_THRESHOLD = 400  # mean abs amplitude; tuned by ear for the current mic
+
+
+def is_silent(data, threshold=SILENCE_THRESHOLD):
     return np.abs(np.frombuffer(data, dtype=np.int16)).mean() < threshold
 
 
@@ -238,23 +337,26 @@ def play_beep():
 
 
 def speak_with_piper(text):
+    assistant_speaking.set()
     try:
-        subprocess.run(
-            [PIPER_PATH, "-m", MODEL_PATH, "-c", CONFIG_PATH, "-f", OUTPUT_WAV],
-            input=text.encode("utf-8"),
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-    except Exception as e:
-        print(f"Piper error: {e}")
-        return
-    if os.path.exists(OUTPUT_WAV):
-        subprocess.run(["aplay", OUTPUT_WAV], stderr=subprocess.DEVNULL)
-    else:
-        print("Piper did not produce output.")
-
-
-def check_wake_word(text):
-    return any(w in text.lower().strip() for w in WAKE_WORDS)
+        try:
+            subprocess.run(
+                [PIPER_PATH, "-m", MODEL_PATH, "-c", CONFIG_PATH, "-f", OUTPUT_WAV],
+                input=text.encode("utf-8"),
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+        except Exception as e:
+            print(f"Piper error: {e}")
+            return
+        if os.path.exists(OUTPUT_WAV):
+            subprocess.run(["aplay", OUTPUT_WAV], stderr=subprocess.DEVNULL)
+        else:
+            print("Piper did not produce output.")
+    finally:
+        # Small grace period: cabin reverb/echo tail can outlast the audio
+        # itself, so don't start listening again the instant playback ends.
+        time.sleep(0.4)
+        assistant_speaking.clear()
 
 
 def open_mic_stream(p, frames_per_buffer=8000):
@@ -416,15 +518,33 @@ def enqueue_song(filepath):
 # Playlist management
 # ---------------------------------------------------------------------------
 
+def _playlist_track_path(stored):
+    """Map a stored playlist entry onto the current MUSIC_FOLDER.
+
+    Playlists store absolute paths, so moving the project (songs used to live
+    in ~/Music) left every entry pointing at a file that no longer exists —
+    each playlist silently reported itself as empty. Tracks only ever live
+    directly in MUSIC_FOLDER, so the filename is the real identity of an
+    entry and the directory part can be rebuilt from wherever the project is
+    checked out now."""
+    return os.path.join(MUSIC_FOLDER, os.path.basename(stored))
+
+
 def load_playlists():
     if not os.path.exists(PLAYLIST_FILE):
         return {}
     try:
         with open(PLAYLIST_FILE, 'r') as f:
-            return json.load(f)
+            playlists = json.load(f)
     except Exception as e:
         print(f"Playlist load error: {e}")
         return {}
+    # Rewritten on every load, so the next save_playlists() quietly migrates
+    # the file to the current location.
+    return {
+        name: [_playlist_track_path(track) for track in tracks]
+        for name, tracks in playlists.items()
+    }
 
 
 def save_playlists(playlists):
@@ -456,14 +576,23 @@ def play_playlist(name):
 # Song finding / downloading
 # ---------------------------------------------------------------------------
 
+def _words(text):
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
 def find_song_in_library(song_name):
     os.makedirs(MUSIC_FOLDER, exist_ok=True)
-    needle = song_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+    needle_words = _words(song_name)
+    if not needle_words:
+        return None
     for filename in os.listdir(MUSIC_FOLDER):
         if not filename.lower().endswith(".mp3"):
             continue
-        hay = os.path.splitext(filename)[0].lower().replace(" ", "").replace("-", "").replace("_", "")
-        if needle in hay or hay in needle:
+        hay_words = _words(os.path.splitext(filename)[0])
+        # Whole-word match only — a raw substring check let short mis-heard
+        # fragments (e.g. "plan") match unrelated words that merely contain
+        # them (e.g. "airplane").
+        if needle_words <= hay_words or hay_words <= needle_words:
             print(f"[SONG] found in library: {filename}", flush=True)
             return os.path.join(MUSIC_FOLDER, filename)
     print(f"[SONG] not in library: {song_name}", flush=True)
@@ -543,13 +672,15 @@ def get_album_tracklist(album_name):
 def find_album_in_library(album_name):
     if not os.path.exists(MUSIC_FOLDER):
         return []
-    needle = album_name.lower().replace(" ", "").replace("-", "").replace("_", "")
+    needle_words = _words(album_name)
+    if not needle_words:
+        return []
     matches = []
     for filename in os.listdir(MUSIC_FOLDER):
         if not filename.lower().endswith(".mp3"):
             continue
-        hay = filename.lower().replace(" ", "").replace("-", "").replace("_", "")
-        if needle in hay:
+        hay_words = _words(filename)
+        if needle_words <= hay_words:
             matches.append(os.path.join(MUSIC_FOLDER, filename))
     return sorted(matches)
 
@@ -854,10 +985,17 @@ def switch_to_speaker():
 # Voice recognition
 # ---------------------------------------------------------------------------
 
-def listen_for_command(timeout_seconds=10):
-    p      = pyaudio.PyAudio()
-    stream = open_mic_stream(p)
-    stream.start_stream()
+def listen_for_command(stream, timeout_seconds=10):
+    # Reuses the same persistent mic stream as wake-word listening — this
+    # mic can't be opened twice at once (opening a second stream on it
+    # while the first is still held open fails with PortAudio "Device
+    # unavailable" and crashes the process).
+    try:
+        backlog = stream.get_read_available()
+        if backlog > 0:
+            stream.read(backlog, exception_on_overflow=False)
+    except Exception as e:
+        print(f"[DEBUG] could not drain stale audio: {e}")
 
     print("\nListening for command...")
 
@@ -865,13 +1003,18 @@ def listen_for_command(timeout_seconds=10):
     silence_start   = None
     speech_detected = False
     final_text      = ""
+    audio_buffer    = bytearray()
 
     recognizer.Reset()
     recognizer_full.Reset()
 
     def finalize():
-        r = json.loads(recognizer.FinalResult()).get("text", "")
-        f = json.loads(recognizer_full.FinalResult()).get("text", "")
+        r = json.loads(recognizer.FinalResult()).get("text", "").strip()
+        f = json.loads(recognizer_full.FinalResult()).get("text", "").strip()
+        if is_name_bearing(r) or is_name_bearing(f):
+            remote = transcribe_remote(bytes(audio_buffer))
+            if remote:
+                f = remote
         return choose_command_text(r, f)
 
     while is_listening:
@@ -882,17 +1025,13 @@ def listen_for_command(timeout_seconds=10):
 
         raw = stream.read(8000, exception_on_overflow=False)
 
-        if is_silent(raw):
-            if speech_detected and silence_start is None:
-                silence_start = time.time()
-            elif silence_start and time.time() - silence_start > 1.5:
-                final_text = finalize()
-                if final_text:
-                    print(f"Command: {final_text}")
-                break
-            continue
-
+        # Every chunk is fed to both recognizers regardless of is_silent() —
+        # ambient noise here (~200-350) sits too close to actual speech level
+        # for amplitude alone to safely gate what reaches Vosk. is_silent()
+        # is used only below, to decide when to start/reset the "how long
+        # since we last heard speech" timer that ends the command.
         data = resample(raw)
+        audio_buffer.extend(data)
 
         done_r = recognizer.AcceptWaveform(data)
         done_f = recognizer_full.AcceptWaveform(data)
@@ -903,60 +1042,89 @@ def listen_for_command(timeout_seconds=10):
                 speech_detected = True
                 print(f"Command: {final_text}")
                 break
-        else:
-            partial = json.loads(recognizer_full.PartialResult()).get("partial", "")
-            if partial:
-                silence_start = None
-                speech_detected = True
-                print(f"Hearing: {partial}    ", end='\r')
-            elif speech_detected and silence_start is None:
-                silence_start = time.time()
-            elif silence_start and time.time() - silence_start > 1.5:
-                final_text = finalize()
-                if final_text:
-                    print(f"Command: {final_text}")
-                break
+            continue
 
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
+        partial = json.loads(recognizer_full.PartialResult()).get("partial", "")
+        if partial:
+            speech_detected = True
+
+        if is_silent(raw):
+            if speech_detected:
+                if silence_start is None:
+                    silence_start = time.time()
+                elif time.time() - silence_start > 1.5:
+                    final_text = finalize()
+                    if final_text:
+                        print(f"Command: {final_text}")
+                    break
+        else:
+            silence_start = None
+            if partial:
+                print(f"Hearing: {partial}    ", end='\r')
+
     return final_text.strip()
 
 
-def continuous_listen_for_wake_word():
-    global wake_word_detected
+WAKE_CHUNK_16K = 1280
 
-    CHUNK_16K = 1280
-    read_size = CHUNK_16K * RESAMPLE_FACTOR
 
+def open_wake_word_stream():
+    """Opens the wake-word mic stream once, for the life of the process.
+    Previously this was opened and torn down on every single wake cycle
+    (every ~10-30s all day); repeatedly rebuilding the audio pipeline is a
+    likely source of startup artifacts (pop/glitch/buffer-priming) right
+    after each reopen, which lined up with spurious near-instant "wake word
+    detected" triggers regardless of what was actually happening acoustically
+    (confirmed: it still happened with no music playing, at a consistent
+    ~1s delay every time — see data/debug_wakes/). Keeping one persistent
+    stream removes that per-cycle restart entirely."""
+    read_size = WAKE_CHUNK_16K * RESAMPLE_FACTOR
     p      = pyaudio.PyAudio()
     stream = open_mic_stream(p, frames_per_buffer=read_size)
     stream.start_stream()
+    return p, stream, read_size
+
+
+def listen_for_wake_word(stream, read_size):
+    global wake_word_detected
+
+    # The stream keeps running (and PipeWire keeps buffering audio into it)
+    # the whole time we're off doing command handling / TTS / playback, not
+    # just while this function's loop is active. Drain whatever piled up
+    # since we last read, so we don't process a backlog of stale audio as
+    # if it just happened.
+    try:
+        backlog = stream.get_read_available()
+        if backlog > 0:
+            stream.read(backlog, exception_on_overflow=False)
+    except Exception as e:
+        print(f"[DEBUG] could not drain stale audio: {e}")
+
+    reset_wake_word_state()
 
     print(f"\nListening for wake word: '{OWW_MODEL_NAME.replace('_', ' ')}'")
-    oww_model.reset()
 
     while is_listening:
         if wake_word_detected:
             break
         try:
             raw = stream.read(read_size, exception_on_overflow=False)
+
+            if assistant_speaking.is_set():
+                # Drain the stream but don't let the assistant hear itself.
+                continue
+
             pcm = np.frombuffer(raw, dtype=np.int16)[::RESAMPLE_FACTOR]
             prediction = oww_model.predict(pcm)
-            score = prediction.get(OWW_MODEL_NAME, 0)
+            score = prediction.get(oww_wakeword_key, 0)
             if score >= WAKE_THRESHOLD:
                 print(f"\nWake word detected (score {score:.2f})")
-                play_beep()
                 wake_word_detected = True
-                oww_model.reset()
+                reset_wake_word_state()
                 break
         except Exception as e:
             print(f"Audio error: {e}")
             time.sleep(0.1)
-
-    stream.stop_stream()
-    stream.close()
-    p.terminate()
 
 
 # ---------------------------------------------------------------------------
@@ -1223,6 +1391,7 @@ def main():
     os.makedirs(os.path.join(BASE_DIR, "assets"), exist_ok=True)
     create_beep_sound()
     set_startup_audio_defaults()
+    apply_volume(current_volume)
     initialize_vosk()
     initialize_openwakeword()
     threading.Thread(target=start_flask, daemon=True).start()
@@ -1231,10 +1400,12 @@ def main():
     is_listening   = True
     script_running = True
 
+    wake_p, wake_stream, wake_read_size = open_wake_word_stream()
+
     try:
         while script_running:
             wake_word_detected = False
-            continuous_listen_for_wake_word()
+            listen_for_wake_word(wake_stream, wake_read_size)
 
             if not script_running or not is_listening:
                 break
@@ -1246,7 +1417,7 @@ def main():
             time.sleep(0.3)
             play_beep()
             is_listening_for_command = True
-            command = listen_for_command(timeout_seconds=10)
+            command = listen_for_command(wake_stream, timeout_seconds=10)
             is_listening_for_command = False
 
             if not command:
@@ -1310,6 +1481,7 @@ def main():
                 continue
 
             print(f"Unrecognised: '{command}'")
+            speak_with_piper("Sorry, I didn't catch that.")
 
     except KeyboardInterrupt:
         print("\nInterrupted.")
@@ -1319,6 +1491,9 @@ def main():
         stop_music()
         is_listening   = False
         script_running = False
+        wake_stream.stop_stream()
+        wake_stream.close()
+        wake_p.terminate()
         print("Shutdown complete.")
 
 

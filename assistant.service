@@ -16,6 +16,11 @@ RestartSec=5
 Environment=XDG_RUNTIME_DIR=/run/user/1000
 Environment=PULSE_SERVER=unix:/run/user/1000/pulse/native
 Environment=PYTHONUNBUFFERED=1
+# Shared secret for the home PC's transcribe_server.py (server/transcribe_server.py).
+# Lives in .env, which is gitignored — this repo is public. The leading "-"
+# means a missing file won't stop the service booting; transcription just
+# falls back to local Vosk.
+EnvironmentFile=-/home/jpie/voice-assistant/.env
 # Logging
 StandardOutput=journal
 StandardError=journal
