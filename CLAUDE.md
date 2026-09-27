@@ -278,6 +278,71 @@ of this is committed.
 Note `/recordings/<name>` uses `send_from_directory` deliberately: the API
 listens on `0.0.0.0`, so a hand-joined path would be a traversal hole.
 
+## Podcasts
+
+Say *"podcast \<search terms\>"*; it searches YouTube, reads back the title and
+length, and only downloads once you answer **yes**. *"resume podcast"* (or
+"continue podcast") returns to the most recent unfinished episode. Re-requesting
+by name starts fresh — resuming is deliberately a separate command.
+
+**Podcasts have their own player, and that is not duplication.** The music
+engine runs `mpg123 -q` fire-and-forget with output discarded, so nothing knows
+how far into a track it is, and pause is SIGSTOP — the position lives inside a
+frozen process and dies with it. An hour-long episode spans several drives, so
+it needs `mpg123 -R` (remote mode): commands on stdin (`LOAD`, `JUMP`, `PAUSE`,
+`QUIT`) and position on stdout as `@F <frame> <frames-left> <secs> <secs-left>`.
+Positions are stored as **frames**, because `JUMP` takes frames.
+
+Three things about remote mode that are not obvious and were each found the
+hard way:
+
+- **Frames-left counts down to 1, never 0.** Testing `frames_left <= 0` to
+  detect the end silently never fires. End-of-track is decided by *position*
+  (`duration - seconds <= 1.0`) instead.
+- **`@P 0` means stopped, but so does the end of a track.** `@P 1` is paused and
+  `@P 2` is playing, so pausing is safe to ignore — but distinguishing "finished"
+  from "stopped early" still needs the position check above, and it decides
+  whether the file gets deleted.
+- **mpg123 does not exit when a track ends** — it idles waiting for the next
+  command. It must be explicitly retired, or `podcast_is_active()` keeps
+  claiming the audio device and pause/stop route to a finished episode.
+
+**Members-only uploads are filtered on `availability`, not on titles.**
+yt-dlp reports `availability=subscriber_only` in `--flat-playlist` output, so
+`UNPLAYABLE_AVAILABILITY` gates on the field rather than pattern-matching
+"MEMBERS" or "AD FREE" in the title. Podcast channels post a lot of these near
+the top of their feed — one real listing was 10 unplayable out of 18 — which is
+why the channel listing deliberately fetches several times more rows than it
+intends to offer.
+
+**Searching uses `--flat-playlist`, not a full extraction.** Extracting each
+result to read its title took over 90 seconds on this Pi and timed out; reading
+the results page takes about 4. YouTube mixes *channels* into search results —
+they come back with a `/channel/` URL and `NA` duration and cannot be
+downloaded, so they are filtered out rather than offered.
+
+**Do not reuse `download_from_youtube()` for episodes.** Its
+`--match-filter "duration < 600"` rejects anything over ten minutes, which is
+every podcast. `download_podcast()` uses `MAX_PODCAST_SECONDS` and encodes mono
+at a speech bitrate — roughly 30MB an hour, measured, against the songs path's
+full-quality encode.
+
+**Episodes live in `data/Podcasts/`, never `MUSIC_FOLDER`.** This is not
+tidiness: `find_song_in_library()` word-matches every file in the music folder,
+so an episode sitting there could be returned for an ordinary song request.
+
+**Predicate ordering is load-bearing.** `is_podcast_resume_command()` must be
+tested before `is_resume_command()`, which matches a bare "resume" and would
+otherwise resume the music. Both podcast predicates are also matched *before*
+the loop/pause/skip/back matchers, because those use substring tests and a
+spoken episode title can easily contain "back" or "stop". The ordering holds in
+two places that must stay in step: the voice chain in `main()` and the
+`/command` hub the dashboard shares.
+
+Finished episodes delete themselves; stopping part-way keeps both the file and
+the position. `data/podcasts.json` is keyed by video URL and mirrors the
+playlists pattern — read fresh, whole-file write, never raises.
+
 ## Style preferences carried over from earlier sessions
 
 - Prefer surgical, targeted edits over rewriting whole files.

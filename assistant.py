@@ -36,6 +36,13 @@ MUSIC_FOLDER    = os.path.join(BASE_DIR, "data", "Music")
 PLAYLIST_FILE   = os.path.join(BASE_DIR, "data", "playlists.json")
 YTDLP_PATH      = "/home/jpie/.local/bin/yt-dlp"
 
+# Podcasts live apart from MUSIC_FOLDER on purpose: find_song_in_library()
+# word-matches every file in there, so a 90-minute episode sitting alongside
+# the music would get returned for an ordinary song request.
+PODCAST_FOLDER  = os.path.join(BASE_DIR, "data", "Podcasts")
+PODCAST_FILE    = os.path.join(BASE_DIR, "data", "podcasts.json")
+MAX_PODCAST_SECONDS = 21600   # 6h sanity cap; the songs path uses 600
+
 # yt-dlp needs a JavaScript runtime to solve YouTube's signature challenges.
 # Without one it silently falls back to clients like visionos/m3u8 whose URLs
 # mostly answer "HTTP Error 403: Forbidden", so songs fail to download for no
@@ -79,10 +86,18 @@ using_bluetooth = False
 # playlist names — see is_name_bearing()) to a faster-whisper server on the
 # home PC. Local Vosk is the automatic fallback if this is unreachable or
 # too slow; see finalize() in listen_for_command().
-WHISPER_SERVER_URL      = "http://100.71.69.96:5051/transcribe"  # Tailscale IP, update after setup
+# Two machines can run the server; the first reachable one wins. Tailscale IPs
+# are per-machine, so this is a list of PCs rather than a list of addresses for
+# one PC. Picked once at startup by select_whisper_server().
+WHISPER_SERVERS = [
+    "http://100.116.77.31:5051",   # preferred
+    "http://100.71.69.96:5051",    # backup
+]
+WHISPER_SERVER_URL      = WHISPER_SERVERS[0] + "/transcribe"   # replaced at startup
 WHISPER_AUTH_TOKEN      = os.environ.get("WHISPER_AUTH_TOKEN", "")  # from .env via the service; never hardcode it
 WHISPER_CONNECT_TIMEOUT = 3   # fail fast if unreachable (no signal / PC off)
 WHISPER_READ_TIMEOUT    = 20  # medium.en on CPU int8 takes ~15s; small.en fit in 10s
+WHISPER_PROBE_TIMEOUT   = 2   # per server, at startup only
 
 # ---------------------------------------------------------------------------
 # Global state
@@ -154,6 +169,8 @@ VOSK_GRAMMAR = json.dumps([
     "add", "add to queue",
     "album", "play album", "add album",
     "playlist",
+    "podcast", "resume podcast", "continue podcast", "podcast resume",
+    "yes", "yeah", "yep", "no", "nope",
     "stop music", "stop the music", "stop playing", "pause music", "turn off music",
     "pause", "hold on", "wait",
     "resume", "continue", "unpause", "play on", "carry on",
@@ -187,6 +204,7 @@ NAME_BEARING_PREFIXES = (
     "play album", "add album", "album",
     "add to queue", "add",
     "playlist",
+    "podcast",
     "play me", "play", "put on",
     "i want to hear", "i want to listen to",
 )
@@ -219,6 +237,35 @@ def strip_punctuation(text):
     ("Livin' On A Prayer")."""
     text = re.sub(r"[^\w\s']", " ", text)
     return re.sub(r"\s+", " ", text).strip()
+
+
+def select_whisper_server():
+    """Pick the first reachable server, preferred first. Called once at startup.
+
+    Any HTTP reply counts as alive, including a 404: the backup PC may be
+    running an older copy of transcribe_server.py that has no "/" route, and
+    refusing it over a status code would strand the Pi on local Vosk for the
+    whole drive.
+
+    If neither answers, the preferred one is kept rather than disabling remote
+    transcription — a PC that boots later in the drive then still gets used,
+    at the cost of one connect timeout per name-bearing command.
+    """
+    global WHISPER_SERVER_URL
+    for base in WHISPER_SERVERS:
+        try:
+            started = time.monotonic()
+            requests.get(base + "/", timeout=WHISPER_PROBE_TIMEOUT)
+            ms = (time.monotonic() - started) * 1000
+            WHISPER_SERVER_URL = base + "/transcribe"
+            label = "preferred" if base == WHISPER_SERVERS[0] else "backup"
+            print(f"Whisper server: {base} ({label}, responded in {ms:.0f}ms)")
+            return WHISPER_SERVER_URL
+        except Exception:
+            print(f"Whisper server unreachable: {base}")
+    WHISPER_SERVER_URL = WHISPER_SERVERS[0] + "/transcribe"
+    print("No Whisper server responded — names fall back to local Vosk.")
+    return WHISPER_SERVER_URL
 
 
 def transcribe_remote(pcm_bytes):
@@ -544,6 +591,11 @@ def _playback_loop():
 
 def _ensure_playback_thread():
     global music_thread
+    # Every music start funnels through here (play_now, enqueue_song,
+    # handle_back), so it is the one place that has to yield the audio device
+    # from a podcast — saving its position on the way out.
+    if podcast_is_active():
+        stop_podcast()
     if music_thread is None or not music_thread.is_alive():
         music_thread = threading.Thread(target=_playback_loop, daemon=True)
         music_thread.start()
@@ -634,6 +686,250 @@ def enqueue_song(filepath):
         queue.append(filepath)
     _ensure_playback_thread()
     return True
+
+
+# ---------------------------------------------------------------------------
+# Podcast playback (resumable)
+# ---------------------------------------------------------------------------
+# Podcasts get their own player because the music engine can't serve them.
+# _playback_loop() runs `mpg123 -q` fire-and-forget with output discarded, so
+# nothing knows how far into a track it is, and pause is SIGSTOP on the
+# process — the position exists only inside a frozen mpg123 and dies with it.
+# An hour-long episode spans several drives, so it has to survive that.
+#
+# `mpg123 -R` (remote mode) solves it: commands go in on stdin (LOAD, JUMP,
+# PAUSE, STOP, QUIT) and it reports position on stdout as
+#   @F <frame> <frames-left> <seconds> <seconds-left>
+# continuously. JUMP takes a frame number and echoes @J, so positions are
+# stored as frames — saving seconds would mean a lossy conversion back.
+
+PODCAST_SAVE_EVERY = 10.0   # seconds between position writes while playing
+
+podcast_lock     = threading.Lock()
+podcast_process  = None
+podcast_entry    = None     # dict from podcasts.json for whatever is loaded
+podcast_frame    = 0
+podcast_seconds  = 0.0
+podcast_duration = 0.0
+podcast_paused   = False
+_podcast_reader  = None
+
+
+def load_podcasts():
+    """Saved episodes and their resume positions, keyed by video URL."""
+    if not os.path.exists(PODCAST_FILE):
+        return {}
+    try:
+        with open(PODCAST_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"Podcast state load error: {e}")
+        return {}
+
+
+def save_podcasts(podcasts):
+    try:
+        with open(PODCAST_FILE, "w") as f:
+            json.dump(podcasts, f, indent=2)
+    except Exception as e:
+        print(f"Podcast state save error: {e}")
+
+
+def _podcast_store_position():
+    """Persist where we are, so the next drive can pick it up."""
+    if not podcast_entry:
+        return
+    podcasts = load_podcasts()
+    entry = podcasts.get(podcast_entry["url"], dict(podcast_entry))
+    entry.update(
+        frame=podcast_frame,
+        seconds=round(podcast_seconds, 1),
+        duration=round(podcast_duration or entry.get("duration", 0), 1),
+        updated=time.time(),
+    )
+    podcasts[podcast_entry["url"]] = entry
+    save_podcasts(podcasts)
+
+
+def _podcast_finished():
+    """Played to the end: drop the file and forget it."""
+    entry = podcast_entry
+    if not entry:
+        return
+    print(f"Podcast finished: {entry.get('title','')}")
+    try:
+        if entry.get("path") and os.path.exists(entry["path"]):
+            os.remove(entry["path"])
+    except OSError as e:
+        print(f"Could not delete finished episode: {e}")
+    podcasts = load_podcasts()
+    podcasts.pop(entry["url"], None)
+    save_podcasts(podcasts)
+
+
+def _podcast_reader_loop(proc):
+    """Track position from mpg123's @F lines until playback stops.
+
+    Runs on its own thread and must never block the caller — @F arrives many
+    times a second during playback.
+    """
+    global podcast_frame, podcast_seconds, podcast_duration
+    global podcast_process, podcast_entry, podcast_paused
+
+    last_saved = time.time()
+    ended_naturally = False
+
+    for raw in proc.stdout:
+        line = raw.strip()
+        if line.startswith("@F "):
+            parts = line.split()
+            try:
+                frame = int(parts[1])
+                secs, secs_left = float(parts[3]), float(parts[4])
+            except (IndexError, ValueError):
+                continue
+            podcast_frame    = frame
+            podcast_seconds  = secs
+            podcast_duration = secs + secs_left
+            if time.time() - last_saved >= PODCAST_SAVE_EVERY:
+                _podcast_store_position()
+                last_saved = time.time()
+        elif line.startswith("@P 0"):
+            # @P 1 is paused and @P 2 is playing, so only a stop or the end of
+            # the track lands here. Which one is decided by position, NOT by
+            # frames-left: that counts down to 1 and never reaches 0.
+            ended_naturally = (podcast_duration - podcast_seconds) <= 1.0
+            break
+
+    if ended_naturally:
+        _podcast_finished()
+        # Remote mode does not exit when a track ends, it idles waiting for the
+        # next command. Retire it, or podcast_is_active() would keep claiming
+        # the audio device and pause/stop would route to a finished episode.
+        with podcast_lock:
+            if podcast_process is proc:
+                try:
+                    proc.stdin.write("QUIT\n")
+                    proc.stdin.flush()
+                    proc.wait(timeout=2)
+                except Exception:
+                    proc.kill()
+                podcast_process = None
+                podcast_entry   = None
+                podcast_paused  = False
+    elif podcast_entry:
+        _podcast_store_position()
+
+
+def podcast_is_active():
+    return podcast_process is not None and podcast_process.poll() is None
+
+
+def _podcast_send(command):
+    if not podcast_is_active():
+        return False
+    try:
+        podcast_process.stdin.write(command + "\n")
+        podcast_process.stdin.flush()
+        return True
+    except (BrokenPipeError, ValueError) as e:
+        print(f"Podcast control error: {e}")
+        return False
+
+
+def stop_podcast(save=True):
+    """Stop playback, keeping the position unless told otherwise."""
+    global podcast_process, podcast_entry, podcast_paused
+    with podcast_lock:
+        if not podcast_is_active():
+            podcast_process = None
+            return
+        if save:
+            _podcast_store_position()
+        _podcast_send("QUIT")
+        try:
+            podcast_process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            podcast_process.kill()
+        podcast_process = None
+        podcast_entry   = None
+        podcast_paused  = False
+
+
+def play_podcast_entry(entry):
+    """Start (or resume) an episode. `entry` comes from podcasts.json."""
+    global podcast_process, podcast_entry, _podcast_reader
+    global podcast_frame, podcast_seconds, podcast_duration, podcast_paused
+
+    path = entry.get("path")
+    if not path or not os.path.exists(path):
+        speak_with_piper("That episode is no longer downloaded.")
+        return False
+
+    stop_music()
+    stop_podcast()
+
+    with podcast_lock:
+        try:
+            podcast_process = subprocess.Popen(
+                ["mpg123", "-R"],
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL, text=True, bufsize=1,
+            )
+        except FileNotFoundError:
+            print("mpg123 not installed. Run: sudo apt install mpg123")
+            speak_with_piper("mpg123 is not installed.")
+            return False
+
+        podcast_entry    = dict(entry)
+        podcast_frame    = int(entry.get("frame", 0) or 0)
+        podcast_seconds  = float(entry.get("seconds", 0) or 0)
+        podcast_duration = float(entry.get("duration", 0) or 0)
+        podcast_paused   = False
+
+        _podcast_send(f"LOAD {path}")
+        if podcast_frame > 0:
+            _podcast_send(f"JUMP {podcast_frame}")
+
+        _podcast_reader = threading.Thread(
+            target=_podcast_reader_loop, args=(podcast_process,), daemon=True
+        )
+        _podcast_reader.start()
+
+    return True
+
+
+def pause_podcast():
+    global podcast_paused
+    if not podcast_is_active() or podcast_paused:
+        return False
+    _podcast_send("PAUSE")
+    podcast_paused = True
+    _podcast_store_position()
+    return True
+
+
+def resume_podcast():
+    global podcast_paused
+    if not podcast_is_active() or not podcast_paused:
+        return False
+    _podcast_send("PAUSE")   # PAUSE toggles in remote mode
+    podcast_paused = False
+    return True
+
+
+def resume_last_podcast():
+    """Continue the episode most recently listened to."""
+    podcasts = load_podcasts()
+    unfinished = [e for e in podcasts.values()
+                  if e.get("path") and os.path.exists(e["path"])]
+    if not unfinished:
+        speak_with_piper("There's no podcast to resume.")
+        return False
+    entry = max(unfinished, key=lambda e: e.get("updated", 0))
+    mins = int(float(entry.get("seconds", 0)) // 60)
+    speak_with_piper(f"Resuming {entry.get('title','the episode')} at {mins} minutes.")
+    return play_podcast_entry(entry)
 
 
 # ---------------------------------------------------------------------------
@@ -766,6 +1062,218 @@ def resolve_song(song_name):
     return result
 
 
+def _format_duration(seconds):
+    """Spoken-friendly length, e.g. "1 hour 32 minutes"."""
+    seconds = int(seconds or 0)
+    hours, minutes = seconds // 3600, (seconds % 3600) // 60
+    hr  = f"{hours} hour{'s' if hours != 1 else ''}"
+    mn  = f"{minutes} minute{'s' if minutes != 1 else ''}"
+    if hours and minutes:
+        return f"{hr} {mn}"
+    return hr if hours else mn
+
+
+# Anything the Pi can't actually fetch. yt-dlp reports these in
+# --flat-playlist output, so members-only uploads are filtered on the field
+# rather than by pattern-matching "MEMBERS" / "AD FREE" in titles.
+UNPLAYABLE_AVAILABILITY = {"subscriber_only", "premium_only", "needs_auth", "private"}
+
+
+def _ytdlp_flat(target, limit=6):
+    """Rows of (title, seconds_or_None, url, availability) for a search/channel.
+
+    --flat-playlist reads the listing page instead of extracting each video:
+    ~4s against 90s+ on this Pi, which matters because the user is stood
+    waiting for a spoken question. Extracting per result was the first attempt
+    and timed out outright.
+    """
+    try:
+        result = subprocess.run(
+            [YTDLP_PATH, *YTDLP_JS_RUNTIME, "--flat-playlist",
+             "--playlist-end", str(limit),
+             "--print", "%(title)s\t%(duration)s\t%(url)s\t%(availability)s", target],
+            capture_output=True, text=True, timeout=60
+        )
+    except subprocess.TimeoutExpired:
+        print(f"[PODCAST] listing timed out: {target}")
+        return []
+    except Exception as e:
+        print(f"[PODCAST] listing failed: {e}")
+        return []
+
+    rows = []
+    for line in result.stdout.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        title, duration, url, availability = (p.strip() for p in parts)
+        try:
+            seconds = float(duration)
+        except ValueError:
+            seconds = None          # "NA" — a channel row, or no length given
+        rows.append((title, seconds, url, availability))
+    return rows
+
+
+def search_podcast(query, results=6):
+    """Episodes to offer as (title, seconds, url) — nothing is downloaded.
+
+    Ordered newest-first when the query names a show. A plain search ranks by
+    relevance, which surfaces a show's *most popular* episode rather than its
+    latest — not what you want when you ask for a podcast by name. YouTube
+    usually returns the show's own channel among the results, and that
+    channel's /videos tab is ordered newest-first (verified: positions 1 and 2
+    were consecutive upload days), so it is listed in preference.
+
+    Falls back to the relevance-ranked videos when no channel turns up, e.g.
+    for a topic rather than a show name.
+    """
+    rows = _ytdlp_flat(f"ytsearch{results}:{query}", limit=results)
+
+    def playable(listing):
+        return [(t, s, u) for t, s, u, avail in listing
+                if s and "watch?v=" in u and avail not in UNPLAYABLE_AVAILABILITY]
+
+    channel = next((url for _, secs, url, _a in rows
+                    if secs is None and ("/channel/" in url or "/@" in url)), None)
+    if channel:
+        # Ask for extra: members-only uploads are common near the top of a
+        # podcast channel and all of them get dropped here.
+        listing = _ytdlp_flat(f"{channel}/videos", limit=results * 3)
+        episodes = playable(listing)
+        if episodes:
+            skipped = len(listing) - len(episodes)
+            print(f"[PODCAST] {len(episodes)} episode(s) from channel, newest first"
+                  f"{f' ({skipped} members-only/unplayable skipped)' if skipped else ''}")
+            return episodes[:results]
+
+    found = playable(rows)
+    print(f"[PODCAST] {len(found)} result(s) by relevance for {query!r}")
+    return found
+
+
+def confirm_by_voice(question):
+    """Ask, then listen for yes/no. None means we couldn't tell.
+
+    "yes"/"no" are in VOSK_GRAMMAR and aren't name-bearing, so this stays on
+    the Pi — no Whisper round trip for a one-word answer.
+    """
+    speak_with_piper(question)
+    answer = listen_for_command(timeout_seconds=8).lower().strip()
+    print(f"[PODCAST] confirmation heard: {answer!r}")
+    if not answer:
+        return None
+    if any(w in answer for w in ("yes", "yeah", "yep", "correct", "that's right")):
+        return True
+    if any(w in answer for w in ("no", "nope", "wrong", "next")):
+        return False
+    return None
+
+
+def download_podcast(title, url):
+    """Fetch an episode's audio into PODCAST_FOLDER. Returns the path or None.
+
+    Deliberately not download_from_youtube(): that caps duration at 600s, which
+    rejects every podcast. Audio is mono at a speech bitrate, so an hour costs
+    roughly 30-40MB rather than the songs path's full-quality encode.
+    """
+    os.makedirs(PODCAST_FOLDER, exist_ok=True)
+    before = set(os.listdir(PODCAST_FOLDER))
+    print(f"[PODCAST] downloading: {title}", flush=True)
+    try:
+        result = subprocess.run(
+            [YTDLP_PATH, *YTDLP_JS_RUNTIME,
+             "--extract-audio", "--audio-format", "mp3", "--audio-quality", "5",
+             "--postprocessor-args", "-ac 1",
+             "--output", os.path.join(PODCAST_FOLDER, "%(title)s.%(ext)s"),
+             "--no-playlist", "--match-filter", f"duration < {MAX_PODCAST_SECONDS}",
+             url],
+            capture_output=True, text=True, timeout=1800
+        )
+    except subprocess.TimeoutExpired:
+        print("[PODCAST] download timed out after 30 minutes", flush=True)
+        return None
+    except Exception as e:
+        print(f"[PODCAST] download error: {e}", flush=True)
+        return None
+
+    if result.returncode != 0:
+        print(f"[PODCAST] yt-dlp failed: {result.stderr[-400:]}", flush=True)
+        return None
+
+    new = [f for f in os.listdir(PODCAST_FOLDER)
+           if f.endswith(".mp3") and f not in before]
+    if not new:
+        # Already downloaded once and never finished — reuse it.
+        existing = [f for f in os.listdir(PODCAST_FOLDER) if f.endswith(".mp3")]
+        if not existing:
+            print("[PODCAST] no mp3 produced", flush=True)
+            return None
+        newest = max(existing, key=lambda f: os.path.getmtime(os.path.join(PODCAST_FOLDER, f)))
+        return os.path.join(PODCAST_FOLDER, newest)
+    return os.path.join(PODCAST_FOLDER, new[0])
+
+
+def _download_and_play_podcast(title, seconds, url):
+    """Fetch an episode then start it. Safe to run on a worker thread — it
+    never touches the mic."""
+    speak_with_piper("Downloading. This may take a few minutes.")
+    path = download_podcast(title, url)
+    if not path:
+        speak_with_piper("Sorry, that episode failed to download.")
+        return
+
+    entry = {"url": url, "title": title, "path": path,
+             "frame": 0, "seconds": 0, "duration": seconds,
+             "updated": time.time()}
+    podcasts = load_podcasts()
+    podcasts[url] = entry
+    save_podcasts(podcasts)
+
+    speak_with_piper("Ready. Playing now.")
+    play_podcast_entry(entry)
+
+
+def handle_podcast_command(query, confirm=True):
+    """Search, confirm by voice, then hand the download to a worker thread.
+
+    **Must run on the main loop thread when confirm=True.** The confirmation
+    listens on the mic, and the wake-word loop is the only other consumer of
+    the audio queue — run both at once and they steal chunks from each other,
+    so the confirmation hears nothing and times out. Only the download, which
+    needs no mic, is backgrounded.
+
+    confirm=False is for the /command API, where the text was typed rather
+    than misheard and there is no one listening to answer.
+    """
+    if not query:
+        speak_with_piper("Which podcast would you like?")
+        return
+
+    speak_with_piper("Searching.")
+    results = search_podcast(query)
+    if not results:
+        speak_with_piper(f"Sorry, I couldn't find a podcast for {query}.")
+        return
+
+    for title, seconds, url in results:
+        if confirm:
+            answer = confirm_by_voice(
+                f"Did you mean {title}? That's {_format_duration(seconds)}. Say yes or no."
+            )
+            if answer is None:
+                speak_with_piper("Sorry, I didn't catch that. Cancelling.")
+                return
+            if not answer:
+                continue
+
+        threading.Thread(target=_download_and_play_podcast,
+                         args=(title, seconds, url), daemon=True).start()
+        return
+
+    speak_with_piper("Sorry, I couldn't find the right episode.")
+
+
 def get_album_tracklist(album_name):
     print(f"Getting tracklist: {album_name}")
     try:
@@ -875,6 +1383,21 @@ def is_break_command(cmd):
     return any(p in cmd for p in ["break", "stop looping", "stop repeating"])
 
 
+def is_podcast_resume_command(cmd):
+    # Must be tested BEFORE is_resume_command(), which matches a bare "resume"
+    # and would otherwise resume the music instead.
+    return any(p in cmd for p in
+               ("resume podcast", "continue podcast", "podcast resume"))
+
+
+def is_podcast_command(cmd):
+    return cmd.startswith("podcast ")
+
+
+def extract_podcast_query(cmd):
+    return cmd[len("podcast "):].strip()
+
+
 def is_playlist_command(cmd):
     return cmd.startswith("playlist ")
 
@@ -972,6 +1495,11 @@ def handle_album_command(command):
 
 
 def handle_pause():
+    # Two playback mechanisms exist, so pause has to find the live one.
+    if podcast_is_active():
+        if pause_podcast():
+            speak_with_piper("Paused.")
+            return
     if pause_music():
         speak_with_piper("Paused.")
     else:
@@ -979,6 +1507,10 @@ def handle_pause():
 
 
 def handle_resume():
+    if podcast_is_active():
+        if resume_podcast():
+            speak_with_piper("Resuming.")
+            return
     if resume_music():
         speak_with_piper("Resuming.")
     else:
@@ -1408,6 +1940,11 @@ def api_state():
         "using_bluetooth":           using_bluetooth,
         "volume":                    current_volume,
         "is_listening_for_command":  is_listening_for_command,
+        "is_podcast":                podcast_is_active(),
+        "podcast_title":             (podcast_entry or {}).get("title"),
+        "podcast_elapsed":           round(podcast_seconds, 1),
+        "podcast_duration":          round(podcast_duration, 1),
+        "podcast_paused":            podcast_paused,
     })
 
 @app.route("/volume", methods=["POST"])
@@ -1426,13 +1963,22 @@ def api_command():
     cmd  = data.get("command", "").lower().strip()
     msg  = ""
     if cmd == "pause_toggle":
-        if is_paused:
+        # The dashboard's one pause button has to drive whichever player is live.
+        if podcast_is_active():
+            if podcast_paused:
+                if resume_podcast(): msg = "Resuming"
+            elif pause_podcast():    msg = "Paused"
+        elif is_paused:
             if resume_music(): msg = "Resuming"
         else:
             if pause_music(): msg = "Paused"
     elif cmd == "skip":     handle_skip();  msg = "Skipping"
     elif cmd == "back":     handle_back();  msg = "Going back"
-    elif cmd == "stop":     stop_music();   msg = "Stopped"
+    elif cmd == "stop":
+        if podcast_is_active():
+            stop_podcast(); msg = "Podcast stopped"
+        else:
+            stop_music();   msg = "Stopped"
     elif cmd == "loop_toggle":
         if is_looping: break_loop(); msg = "Loop off"
         else:
@@ -1442,6 +1988,16 @@ def api_command():
     elif cmd == "reset":
         conversation_history = []
         msg = "History cleared"
+    elif is_podcast_resume_command(cmd):
+        threading.Thread(target=resume_last_podcast, daemon=True).start()
+        msg = "Resuming podcast"
+    elif is_podcast_command(cmd):
+        # confirm=False: this text was typed, not misheard, and nobody is
+        # waiting at the mic to answer a spoken question.
+        query = extract_podcast_query(cmd)
+        threading.Thread(target=handle_podcast_command,
+                         args=(query, False), daemon=True).start()
+        msg = f"Searching for {query}"
     elif is_play_command(cmd):
         threading.Thread(target=handle_play_command, args=(cmd,), daemon=True).start()
         song = extract_song_name(cmd)
@@ -1641,6 +2197,7 @@ def main():
     os.makedirs(MUSIC_FOLDER, exist_ok=True)
     os.makedirs(os.path.join(BASE_DIR, "assets"), exist_ok=True)
     create_beep_sound()
+    select_whisper_server()
     set_startup_audio_defaults()
     apply_volume(current_volume)
     initialize_vosk()
@@ -1686,6 +2243,22 @@ def main():
                 speak_with_piper("Okay, starting fresh.")
                 continue
 
+            # Podcasts are matched before everything else: "resume podcast"
+            # would otherwise hit is_resume_command()'s bare "resume", and a
+            # spoken episode name can contain words like "back" or "stop"
+            # that the substring matchers below would claim.
+            if is_podcast_resume_command(cmd):
+                threading.Thread(target=resume_last_podcast, daemon=True).start()
+                continue
+            if is_podcast_command(cmd):
+                # Deliberately NOT on a thread: the confirmation listens on the
+                # mic, and returning to listen_for_wake_word() meanwhile would
+                # give the audio queue two consumers stealing each other's
+                # chunks — the confirmation then hears nothing. It backgrounds
+                # the download itself once confirmed.
+                handle_podcast_command(extract_podcast_query(command))
+                continue
+
             if is_loop_command(cmd):
                 handle_loop()
                 continue
@@ -1706,8 +2279,12 @@ def main():
                 handle_back()
                 continue
             if is_stop_music_command(cmd):
-                stop_music()
-                speak_with_piper("Music stopped.")
+                if podcast_is_active():
+                    stop_podcast()
+                    speak_with_piper("Podcast stopped.")
+                else:
+                    stop_music()
+                    speak_with_piper("Music stopped.")
                 continue
 
             if is_bt_command(cmd):

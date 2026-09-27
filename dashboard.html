@@ -951,6 +951,7 @@
   <div class="panel-label">NOW PLAYING</div>
   <div class="song-title song-idle" id="song-title">IDLE</div>
   <div class="queue-info" id="queue-info">QUEUE &mdash; <span id="queue-count">0</span> / 30</div>
+  <div class="queue-info" id="podcast-progress" style="display:none"></div>
   <div class="playback-state">
     <div class="state-badge" id="badge-playing">▶ PLAYING</div>
     <div class="state-badge" id="badge-paused">⏸ PAUSED</div>
@@ -1127,6 +1128,15 @@ async function sendCmd(cmd) {
 }
 
 // ── State polling ──
+function fmtTime(seconds) {
+  seconds = Math.max(0, Math.floor(seconds || 0));
+  const h = Math.floor(seconds / 3600),
+        m = Math.floor((seconds % 3600) / 60),
+        sec = seconds % 60;
+  const pad = n => String(n).padStart(2, '0');
+  return h ? `${h}:${pad(m)}:${pad(sec)}` : `${m}:${pad(sec)}`;
+}
+
 async function pollState() {
   plPollCounter++;
   if (plPollCounter % 10 === 0) loadPlaylists();
@@ -1134,12 +1144,25 @@ async function pollState() {
     const res  = await fetch(`${API}/state`);
     const data = await res.json();
 
-    // Song title
+    // Song title — a playing podcast takes over this panel
     const titleEl = document.getElementById('song-title');
-    if (data.current_song) {
+    const podEl   = document.getElementById('podcast-progress');
+    if (data.is_podcast && data.podcast_title) {
+      titleEl.textContent = data.podcast_title;
+      titleEl.classList.remove('song-idle');
+      podEl.textContent = 'PODCAST \u2014 ' + fmtTime(data.podcast_elapsed) +
+                          ' / ' + fmtTime(data.podcast_duration) +
+                          (data.podcast_paused ? '  (PAUSED)' : '');
+      podEl.style.display = '';
+      document.getElementById('queue-info').style.display = 'none';
+    } else if (data.current_song) {
+      podEl.style.display = 'none';
+      document.getElementById('queue-info').style.display = '';
       titleEl.textContent = data.current_song;
       titleEl.classList.remove('song-idle');
     } else {
+      podEl.style.display = 'none';
+      document.getElementById('queue-info').style.display = '';
       titleEl.textContent = 'IDLE';
       titleEl.classList.add('song-idle');
     }

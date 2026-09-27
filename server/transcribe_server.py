@@ -42,6 +42,13 @@ DENOISE_STRENGTH = 0.75
 
 WHISPER_RATE = 16000
 
+# Whisper always processes a padded 30-second window, so transcription costs
+# the same whether the clip is 2 seconds or 25 — measured at a flat ~11.3s for
+# medium.en on this CPU, with network (~30ms) and denoising (~40ms) negligible
+# beside it. Beam search is therefore the only knob that doesn't cost accuracy
+# outright: 1 is greedy decoding, 5 was the previous value.
+BEAM_SIZE = 1
+
 # Every clip the Pi sends is kept here, raw and denoised, so the pair can be
 # compared by ear at http://<pc>:5051/ . Purely diagnostic; the Pi keeps its
 # own copy of what it sent in data/command_recordings/.
@@ -227,7 +234,7 @@ def transcribe():
     segments, _ = model.transcribe(
         source,
         language="en",
-        beam_size=5,
+        beam_size=BEAM_SIZE,
         vad_filter=True,
         initial_prompt="Play, add, or search for a song, artist, album, or playlist.",
     )
