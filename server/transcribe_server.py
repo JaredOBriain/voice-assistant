@@ -29,7 +29,13 @@ except ImportError:
     nr = None
 
 PORT       = 5051
-MODEL_SIZE = "medium.en"  # was "small.en" — testing accuracy/speed tradeoff
+# medium.en measured a flat ~10.5s per request on this CPU. Whisper always
+# encodes a padded 30-second window, so a 3s command costs the same as a 25s
+# one — the encoder is the work, and a smaller model is the only CPU-side way
+# to shrink it. Revert to "medium.en" if names start coming back wrong.
+# WHISPER_READ_TIMEOUT on the Pi only needs revisiting when moving to a
+# LARGER model; small.en is comfortably inside the existing 20s.
+MODEL_SIZE = "small.en"
 AUTH_TOKEN = os.environ.get("WHISPER_AUTH_TOKEN", "")
 
 # The Pi's mic noise is broadly stationary hiss once its 100Hz high-pass has
