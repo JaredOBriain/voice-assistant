@@ -1,7 +1,7 @@
 """
 Benchmark Const-me/Whisper (Direct3D 11, AMD-capable) against faster-whisper.
 
-Runs on the WINDOWS server PC, not the Pi — Const-me is Windows-only and the
+Runs on the WINDOWS server PC, not the Pi - Const-me is Windows-only and the
 whole point is the GPU in this machine. faster-whisper cannot use an RX 590:
 CTranslate2 has no native ROCm and the community forks start at gfx900, while
 Polaris is gfx803. Const-me sidesteps that with compute shaders.
@@ -12,7 +12,7 @@ worth attempting.
 
 Setup on this PC:
   1. Extract cli.zip from Const-me/Whisper release 1.12.0, e.g. C:\\constme\\
-  2. Put ggml-medium.en.bin beside it — the GGML equivalent of the medium.en
+  2. Put ggml-medium.en.bin beside it - the GGML equivalent of the medium.en
      that faster-whisper is running, so the comparison is like-for-like
   3. Have transcribe_server.py running locally (it is the thing being raced)
   4. WHISPER_AUTH_TOKEN set, same as the server uses
@@ -41,12 +41,12 @@ DEFAULTS = {
 
 # Clips worth looking at by eye rather than by median. medium.en gets both
 # wrong: it returns "All of a sudden." for a spoken "pause", and drops the
-# "take" from "play take it easy". A greedy decoder — which Const-me may be,
-# since it exposes no beam-size flag — tends to be worse on exactly this kind
+# "take" from "play take it easy". A greedy decoder - which Const-me may be,
+# since it exposes no beam-size flag - tends to be worse on exactly this kind
 # of short utterance, so these decide the accuracy question.
 WATCH = {
-    "20260918_200122": 'said "pause" — medium.en returns "All of a sudden."',
-    "20260918_202458": 'said "play TAKE it easy" — medium.en drops "take"',
+    "20260918_200122": 'said "pause" - medium.en returns "All of a sudden."',
+    "20260918_202458": 'said "play TAKE it easy" - medium.en drops "take"',
 }
 
 
@@ -109,7 +109,7 @@ def fetch_clips(pi_url, count, into):
 
 
 def run_constme(exe, model, clip, prompt):
-    """Time the whole invocation — model load included.
+    """Time the whole invocation - model load included.
 
     That is deliberate. Const-me has no daemon mode, so a CLI integration
     would reload the model on every single request, and a number that hides
@@ -163,7 +163,7 @@ def main():
 
     token = os.environ.get("WHISPER_AUTH_TOKEN", "")
     if not token:
-        print("WARNING: WHISPER_AUTH_TOKEN unset — the server will reject "
+        print("WARNING: WHISPER_AUTH_TOKEN unset - the server will reject "
               "requests unless it is also running without a token.\n")
 
     if not os.path.exists(args.model):
@@ -172,7 +172,7 @@ def main():
 
     prompt = server_initial_prompt(
         os.path.join(os.path.dirname(os.path.abspath(__file__)), "transcribe_server.py"))
-    print(f"Prompt shared with the server: {'yes' if prompt else 'NO — comparison is unfair'}")
+    print(f"Prompt shared with the server: {'yes' if prompt else 'NO - comparison is unfair'}")
 
     print("\n=== adapters Const-me can see ===")
     print(list_adapters(args.exe))

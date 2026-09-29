@@ -1,5 +1,5 @@
 # One-time setup for the Const-me/Whisper GPU trial. Run on the WINDOWS server
-# PC — Const-me is Windows-only and the point of the trial is the GPU here.
+# PC - Const-me is Windows-only and the point of the trial is the GPU here.
 #
 #   powershell -ExecutionPolicy Bypass -File setup_constme.ps1
 #
@@ -30,7 +30,7 @@ function Get-Checked($url, $dest, $expected) {
     curl.exe -L --fail --progress-bar -o $dest $url
     $got = (Get-Item $dest).Length
     if ($got -ne $expected) {
-        throw "$dest is $got bytes, expected $expected — download incomplete"
+        throw "$dest is $got bytes, expected $expected - download incomplete"
     }
     Write-Host "  ok ($got bytes)" -ForegroundColor Green
 }
@@ -61,5 +61,5 @@ Next:
   `$env:WHISPER_AUTH_TOKEN = "<your token>"
   python bench_constme.py
 
-(transcribe_server.py must be running locally — it is what gets raced.)
+(transcribe_server.py must be running locally - it is what gets raced.)
 "@ -ForegroundColor Cyan
