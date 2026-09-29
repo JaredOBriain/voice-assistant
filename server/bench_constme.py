@@ -127,15 +127,19 @@ def run_constme(exe, model, clip, prompt):
 
     # -otxt writes beside the input; naming differs between builds, so try
     # both rather than parse stdout, which carries progress noise.
+    # utf-8-sig, not utf-8: Const-me writes the .txt with a BOM, and plain
+    # utf-8 keeps it as a leading U+FEFF. That is not just untidy - it makes
+    # every comparison against faster-whisper's text fail, so identical
+    # transcriptions would be reported as disagreements.
     for candidate in (clip + ".txt", os.path.splitext(clip)[0] + ".txt"):
         if os.path.exists(candidate):
             try:
-                text = open(candidate, encoding="utf-8", errors="replace").read()
+                text = open(candidate, encoding="utf-8-sig", errors="replace").read()
             except OSError:
                 continue
-            return elapsed, " ".join(text.split())
+            return elapsed, " ".join(text.split()).lstrip("\ufeff")
 
-    text = " ".join(proc.stdout.split())
+    text = " ".join(proc.stdout.split()).lstrip("\ufeff")
     if not text and proc.returncode != 0:
         text = f"(failed rc={proc.returncode}: {proc.stderr.strip()[:120]})"
     return elapsed, text
