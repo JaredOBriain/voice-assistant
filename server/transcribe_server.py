@@ -16,6 +16,7 @@ PC with its own requirements.txt.
 """
 import io
 import os
+import sys
 import time
 import wave
 
@@ -25,8 +26,13 @@ from faster_whisper import WhisperModel
 
 try:
     import noisereduce as nr
-except ImportError:
+    _nr_import_error = None
+except ImportError as e:
+    # Keep the reason. "Not installed" is only one cause — it is just as often
+    # installed against a different interpreter, or installed but unable to
+    # import because one of ITS dependencies is missing.
     nr = None
+    _nr_import_error = e
 
 PORT       = 5051
 # small.en was tried and rejected. It was genuinely 3x faster (10.5s -> 3.5s)
@@ -87,8 +93,9 @@ app = Flask(__name__)
 print(f"Loading faster-whisper model '{MODEL_SIZE}' (CPU, int8)...")
 model = WhisperModel(MODEL_SIZE, device="cpu", compute_type="int8")
 if DENOISE and nr is None:
-    print("noisereduce not installed — transcribing raw audio. "
-          "pip install noisereduce")
+    print(f"Denoising OFF — could not import noisereduce: {_nr_import_error}")
+    print(f"  running interpreter: {sys.executable}")
+    print(f'  install into THIS interpreter: "{sys.executable}" -m pip install noisereduce')
 print(f"Model loaded. Denoise: {DENOISE and nr is not None}. Ready.")
 
 
