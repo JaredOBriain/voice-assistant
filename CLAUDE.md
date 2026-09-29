@@ -65,6 +65,22 @@ back to its much weaker local Vosk transcription. Note denoising adds to the
 server's response time, which is bounded by the Pi's `WHISPER_READ_TIMEOUT`;
 the per-request timing log exists to keep that visible.
 
+**`small.en` was tried on the server and rejected — don't re-propose it.**
+It measured 3x faster (10.5s to 3.5s) and looked fine on a six-clip bench,
+but in real use it needed repeating far too often. The bench was misleading
+because it contained almost no long song titles, which is the entire reason
+the server exists. Likewise `beam_size=1`: only 7% faster than 5, because
+beam search touches the decoder and a spoken command emits a handful of
+tokens — the encoder is the cost. Both are back at `medium.en` / `beam_size=5`
+and ~11s per request is the accepted price of accuracy.
+
+Clip length is **not** a lever: Whisper always encodes a padded 30-second
+window, so 3s and 25s of audio cost the same (measured 10.66s vs 11.88s).
+Only model size and hardware change that. The AMD RX 590 on the server PC
+can't help either — it's Polaris/gfx803, below the gfx900 floor of every
+CTranslate2 ROCm fork, and the one Polaris-capable route (whisper.cpp via
+Vulkan) is ~13x slower on Windows than Linux.
+
 **Whisper output is punctuated; the command matchers are not.**
 faster-whisper returns things like `"Play, Bohemian Rhapsody."`, and every
 matcher downstream (`is_play_command`, `extract_song_name`, the `_words()`

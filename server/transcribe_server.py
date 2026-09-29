@@ -29,13 +29,17 @@ except ImportError:
     nr = None
 
 PORT       = 5051
-# medium.en measured a flat ~10.5s per request on this CPU. Whisper always
+# small.en was tried and rejected. It was genuinely 3x faster (10.5s -> 3.5s)
+# and looked fine on a six-clip bench, but in real use it needed repeating far
+# too often. The bench was misleading because it held almost no long song
+# titles — which is the entire reason this server exists, and exactly where a
+# bigger model earns its keep. Don't re-run that comparison and conclude
+# small.en is fine; it isn't, on the audio that matters.
+#
+# Accuracy is the point here and ~11s is the accepted price. Whisper always
 # encodes a padded 30-second window, so a 3s command costs the same as a 25s
-# one — the encoder is the work, and a smaller model is the only CPU-side way
-# to shrink it. Revert to "medium.en" if names start coming back wrong.
-# WHISPER_READ_TIMEOUT on the Pi only needs revisiting when moving to a
-# LARGER model; small.en is comfortably inside the existing 20s.
-MODEL_SIZE = "small.en"
+# one — clip length is not a lever, only model size and hardware are.
+MODEL_SIZE = "medium.en"
 AUTH_TOKEN = os.environ.get("WHISPER_AUTH_TOKEN", "")
 
 # The Pi's mic noise is broadly stationary hiss once its 100Hz high-pass has
@@ -48,12 +52,11 @@ DENOISE_STRENGTH = 0.75
 
 WHISPER_RATE = 16000
 
-# Whisper always processes a padded 30-second window, so transcription costs
-# the same whether the clip is 2 seconds or 25 — measured at a flat ~11.3s for
-# medium.en on this CPU, with network (~30ms) and denoising (~40ms) negligible
-# beside it. Beam search is therefore the only knob that doesn't cost accuracy
-# outright: 1 is greedy decoding, 5 was the previous value.
-BEAM_SIZE = 1
+# Greedy decoding (1) was measured at only 7% faster than 5 — 11.34s to 10.50s
+# — because beam search touches the decoder and a spoken command emits a
+# handful of tokens. The cost is the encoder. So dropping the beam gives up
+# accuracy for almost nothing, and it is back at 5.
+BEAM_SIZE = 5
 
 # Every clip the Pi sends is kept here, raw and denoised, so the pair can be
 # compared by ear at http://<pc>:5051/ . Purely diagnostic; the Pi keeps its
