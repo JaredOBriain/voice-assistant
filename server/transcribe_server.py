@@ -64,6 +64,18 @@ WHISPER_RATE = 16000
 # accuracy for almost nothing, and it is back at 5.
 BEAM_SIZE = 5
 
+# Whisper conditions on this text, so it biases decoding toward the words the
+# assistant actually accepts. Worth listing the control words and not just the
+# music ones: short utterances carry little context and are where it guesses
+# worst — "pause" came back as "All of a sudden" without them.
+INITIAL_PROMPT = (
+    "Voice commands for a music assistant. "
+    "Play, add, or search for a song, artist, album, playlist, or podcast. "
+    "Pause. Resume. Skip. Next track. Previous track. Go back. Stop the music. "
+    "Loop. Repeat. Break. Volume. Bluetooth. Headphones. Speaker. "
+    "Resume podcast. Yes. No."
+)
+
 # Every clip the Pi sends is kept here, raw and denoised, so the pair can be
 # compared by ear at http://<pc>:5051/ . Purely diagnostic; the Pi keeps its
 # own copy of what it sent in data/command_recordings/.
@@ -252,7 +264,7 @@ def transcribe():
         language="en",
         beam_size=BEAM_SIZE,
         vad_filter=True,
-        initial_prompt="Play, add, or search for a song, artist, album, or playlist.",
+        initial_prompt=INITIAL_PROMPT,
     )
     text = " ".join(segment.text.strip() for segment in segments).strip()
     transcribe_ms = (time.monotonic() - started) * 1000

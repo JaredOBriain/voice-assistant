@@ -279,6 +279,9 @@ def transcribe_remote(pcm_bytes):
         wf.setframerate(VOSK_RATE)
         wf.writeframes(pcm_bytes)
 
+    # Roughly ten seconds of nothing otherwise — Whisper encodes a padded
+    # 30-second window however short the command was.
+    speak_with_piper("One moment.")
     try:
         response = requests.post(
             WHISPER_SERVER_URL,
@@ -526,6 +529,31 @@ def read_audio(frames):
     out = bytes(_audio_leftover[:want])
     del _audio_leftover[:want]
     return out
+
+
+DOWNLOAD_HEARTBEAT_SECONDS = 10
+
+
+def start_speaking_heartbeat(message, seconds=DOWNLOAD_HEARTBEAT_SECONDS):
+    """Repeat `message` aloud until the returned Event is set.
+
+    A yt-dlp fetch can run for minutes saying nothing, which reads as a crash
+    from the driver's seat. The first line lands one interval in, so a library
+    hit or a quick download stays silent.
+
+    Caller must set() it in a finally — a heartbeat left running after a
+    failed download would talk forever. Note it also mutes wake-word detection
+    while speaking (speak_with_piper sets assistant_speaking), so the interval
+    trades reassurance against being briefly deaf.
+    """
+    stop = threading.Event()
+
+    def beat():
+        while not stop.wait(seconds):
+            speak_with_piper(message)
+
+    threading.Thread(target=beat, daemon=True).start()
+    return stop
 
 
 def open_mic_stream(p, frames_per_buffer=8000):
@@ -1021,6 +1049,7 @@ def download_from_youtube(song_name):
     print(f"[YTDLP] path check: {YTDLP_PATH} exists={os.path.exists(YTDLP_PATH)}", flush=True)
     print(f"[YTDLP] searching: {song_name}", flush=True)
     output_template = os.path.join(MUSIC_FOLDER, "%(title)s.%(ext)s")
+    beat = start_speaking_heartbeat("Still downloading.")
     try:
         result = subprocess.run(
             [
@@ -1052,6 +1081,8 @@ def download_from_youtube(song_name):
         print(f"[YTDLP] binary not found at {YTDLP_PATH}", flush=True)
     except Exception as e:
         print(f"[YTDLP] unexpected error: {e}", flush=True)
+    finally:
+        beat.set()
     return None
 
 
@@ -1180,6 +1211,7 @@ def download_podcast(title, url):
     os.makedirs(PODCAST_FOLDER, exist_ok=True)
     before = set(os.listdir(PODCAST_FOLDER))
     print(f"[PODCAST] downloading: {title}", flush=True)
+    beat = start_speaking_heartbeat("Still downloading the episode.")
     try:
         result = subprocess.run(
             [YTDLP_PATH, *YTDLP_JS_RUNTIME,
@@ -1196,6 +1228,8 @@ def download_podcast(title, url):
     except Exception as e:
         print(f"[PODCAST] download error: {e}", flush=True)
         return None
+    finally:
+        beat.set()
 
     if result.returncode != 0:
         print(f"[PODCAST] yt-dlp failed: {result.stderr[-400:]}", flush=True)
@@ -1430,6 +1464,9 @@ def handle_play_command(command):
         speak_with_piper("What song would you like me to play?")
         return
     print(f"Looking for: {song_name}")
+    # resolve_song() can sit in yt-dlp for a minute or more. Say so first,
+    # or the car goes silent with no sign anything is happening.
+    speak_with_piper(f"Looking for {song_name}.")
     filepath = resolve_song(song_name)
     if filepath:
         speak_with_piper(f"Playing {os.path.splitext(os.path.basename(filepath))[0]}.")
@@ -2231,6 +2268,7 @@ def main():
 
             if not command:
                 print("No command. Back to sleep.")
+                speak_with_piper("I didn't catch that.")
                 continue
 
             cmd = command.lower().strip()
