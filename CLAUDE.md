@@ -76,10 +76,41 @@ and ~11s per request is the accepted price of accuracy.
 
 Clip length is **not** a lever: Whisper always encodes a padded 30-second
 window, so 3s and 25s of audio cost the same (measured 10.66s vs 11.88s).
-Only model size and hardware change that. The AMD RX 590 on the server PC
-can't help either — it's Polaris/gfx803, below the gfx900 floor of every
-CTranslate2 ROCm fork, and the one Polaris-capable route (whisper.cpp via
-Vulkan) is ~13x slower on Windows than Linux.
+Only model size and hardware change that — and hardware is what finally won.
+
+**The RX 590 does help, via Const-me/Whisper — but not through
+faster-whisper.** faster-whisper is built on CTranslate2, which has no native
+ROCm, and every community ROCm fork starts at gfx900 while this card is
+Polaris/gfx803. Const-me/Whisper sidesteps that entirely by running Whisper on
+Direct3D 11 compute shaders, so any DX11 GPU works. Measured **~2x faster than
+medium.en in practice at accuracy judged equal or better**, at the same model
+size — which is why it costs nothing, unlike `small.en`.
+
+`ENGINE` in `transcribe_server.py` selects the engine and defaults to
+`constme`, since the desktop is the preferred server and has the GPU. The
+laptop has neither and runs **`transcribe_server_laptop.py`**, a thin wrapper
+that forces `faster-whisper` through `WHISPER_ENGINE` — a wrapper rather than a
+second copy, so fixes cannot land in one and not the other. faster-whisper
+stays loaded either way as the per-request fallback: an experimental engine
+must never cost the Pi its transcription, because it would drop to much weaker
+local Vosk. `?engine=constme` / `?engine=faster-whisper` overrides for one
+request, which is how the two were compared on identical audio.
+
+Const-me needs its own setup, none of it automatic. `CONSTME_MODEL` has **no
+default** because which GGML model is used is a real choice and a guessed path
+would silently transcribe with the wrong one. It wants **GGML** models, not the
+CTranslate2 ones faster-whisper downloads. `cli.zip` from release 1.12.0 ships
+prebuilt, so nothing needs compiling, and `server/setup_constme.ps1` fetches
+both it and the model. Its `-otxt` output carries a **UTF-8 BOM**: read with
+`utf-8-sig` or every text comparison fails for no visible reason. It exposes no
+beam-size flag, so it may decode greedily — that did not hurt accuracy in
+practice, but it is why the comparison was done by ear rather than assumed.
+Last Const-me release is July 2023, so it is unmaintained; the binary is
+self-contained, which is why that matters less than it would for a scraper.
+
+One route that genuinely is a dead end: whisper.cpp via Vulkan does support
+Polaris, but it measured ~13x slower on Windows than Linux, so it is only worth
+revisiting if that PC ever runs Linux.
 
 **Whisper output is punctuated; the command matchers are not.**
 faster-whisper returns things like `"Play, Bohemian Rhapsody."`, and every

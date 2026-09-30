@@ -68,11 +68,13 @@ WHISPER_RATE = 16000
 # gfx803. Measured ~3x faster at equivalent accuracy; this switch exists to
 # test that properly before committing to it.
 #
-# Set to "constme" on this branch so ordinary driving exercises it and the
-# accuracy can be judged from real use rather than six clips. faster-whisper
-# stays loaded as the fallback. Override per request with ?engine=... to put
-# the same clip through both without restarting anything.
-ENGINE = "constme"
+# Defaults to constme because the desktop - the preferred server - has the
+# RX 590 and Const-me installed. The laptop has neither and runs
+# transcribe_server_laptop.py, which forces faster-whisper via WHISPER_ENGINE.
+# faster-whisper stays loaded either way as the per-request fallback, and
+# ?engine=... overrides for a single request so the same clip can go through
+# both without a restart.
+ENGINE = os.environ.get("WHISPER_ENGINE", "constme")
 
 CONSTME_EXE   = os.environ.get("CONSTME_EXE", r"C:\constme\main.exe")
 # No default: which GGML model to use is a real choice (size, .en or not) and
