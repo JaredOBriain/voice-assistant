@@ -1708,7 +1708,7 @@ MAX_COMMAND_RECORDINGS = 30
 # something to leave running. Set True when a misheard command needs chasing
 # down, then restart the service. /recordings keeps serving whatever is
 # already on disk either way.
-SAVE_COMMAND_RECORDINGS = False
+SAVE_COMMAND_RECORDINGS = True   # ON for engine testing; set False when done
 
 
 def save_command_recording(pcm_bytes, decoded):
