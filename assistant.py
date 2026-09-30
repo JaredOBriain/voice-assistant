@@ -8,6 +8,7 @@ import json
 import wave
 import io
 import pyaudio
+import tempfile
 import threading
 import sys
 import requests
@@ -27,7 +28,6 @@ from flask_cors import CORS
 BASE_DIR        = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH      = os.path.join(BASE_DIR, "piper", "en_US-lessac-medium.onnx")
 CONFIG_PATH     = os.path.join(BASE_DIR, "piper", "en_US-lessac-medium.onnx.json")
-OUTPUT_WAV      = os.path.join(BASE_DIR, "data", "test.wav")
 THINKING_SOUND  = os.path.join(BASE_DIR, "assets", "process.wav")
 VOSK_MODEL_PATH = os.path.join(BASE_DIR, "models", "vosk-model-small-en-us-0.15")
 BEEP_SOUND      = os.path.join(BASE_DIR, "assets", "beep.wav")
@@ -431,27 +431,61 @@ def play_beep():
         print(f"Beep error: {e}")
 
 
+speech_lock = threading.Lock()
+
+
 def speak_with_piper(text):
-    assistant_speaking.set()
-    try:
+    """Speak one line. Serialised, and never shares a file between callers.
+
+    Three threads can reach here at once: the main loop, a command handler
+    such as handle_play_command(), and the download heartbeat. They all used
+    to render into one shared wav and then aplay it, so one thread's
+    piper could truncate the file while another thread's aplay was reading
+    it. aplay then blocks indefinitely, and if the blocked thread is the main
+    loop the assistant never returns to listen_for_wake_word() - no error, no
+    log line, it just stops responding to the wake word. assistant_speaking
+    also stays set, muting detection even if the loop were running.
+
+    So: one speaker at a time, a private temp file each, and timeouts, so a
+    wedged aplay costs one line instead of the whole assistant.
+    """
+    with speech_lock:
+        assistant_speaking.set()
+        wav = None
         try:
-            subprocess.run(
-                [PIPER_PATH, "-m", MODEL_PATH, "-c", CONFIG_PATH, "-f", OUTPUT_WAV],
-                input=text.encode("utf-8"),
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
+            fd, wav = tempfile.mkstemp(suffix=".wav", prefix="piper_")
+            os.close(fd)
+            try:
+                subprocess.run(
+                    [PIPER_PATH, "-m", MODEL_PATH, "-c", CONFIG_PATH, "-f", wav],
+                    input=text.encode("utf-8"),
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                    timeout=30,
+                )
+            except Exception as e:
+                print(f"Piper error: {e}")
+                return
+            if os.path.getsize(wav) > 0:
+                # 25s, not 60: the longest line the assistant says is the
+                # podcast confirmation, well under 15s. A wedged aplay costs
+                # exactly this much deafness, so it should not be a minute.
+                subprocess.run(["aplay", wav], stderr=subprocess.DEVNULL, timeout=25)
+            else:
+                print("Piper did not produce output.")
+        except subprocess.TimeoutExpired:
+            print("Speech timed out - dropping this line")
         except Exception as e:
-            print(f"Piper error: {e}")
-            return
-        if os.path.exists(OUTPUT_WAV):
-            subprocess.run(["aplay", OUTPUT_WAV], stderr=subprocess.DEVNULL)
-        else:
-            print("Piper did not produce output.")
-    finally:
-        # Small grace period: cabin reverb/echo tail can outlast the audio
-        # itself, so don't start listening again the instant playback ends.
-        time.sleep(0.4)
-        assistant_speaking.clear()
+            print(f"Speech error: {e}")
+        finally:
+            # Small grace period: cabin reverb/echo tail can outlast the audio
+            # itself, so don't start listening again the instant playback ends.
+            time.sleep(0.4)
+            assistant_speaking.clear()
+            if wav:
+                try:
+                    os.remove(wav)
+                except OSError:
+                    pass
 
 
 # ---------------------------------------------------------------------------
@@ -1908,6 +1942,7 @@ def listen_for_wake_word(read_size):
             pcm = np.frombuffer(raw, dtype=np.int16)[::RESAMPLE_FACTOR]
             prediction = oww_model.predict(pcm)
             score = prediction.get(oww_wakeword_key, 0)
+
             if score >= WAKE_THRESHOLD:
                 print(f"\nWake word detected (score {score:.2f})")
                 wake_word_detected = True
