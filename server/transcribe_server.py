@@ -102,7 +102,7 @@ INITIAL_PROMPT = (
 # Every clip the Pi sends is kept here, raw and denoised, so the pair can be
 # compared by ear at http://<pc>:5051/ . Purely diagnostic; the Pi keeps its
 # own copy of what it sent in data/command_recordings/.
-SAVE_CLIPS = True    # ON for engine testing; set False when done
+SAVE_CLIPS = False   # debugging aid - set True to collect again
 CLIPS_DIR  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "clips")
 MAX_CLIPS  = 30
 
