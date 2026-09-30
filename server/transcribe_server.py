@@ -68,9 +68,11 @@ WHISPER_RATE = 16000
 # gfx803. Measured ~3x faster at equivalent accuracy; this switch exists to
 # test that properly before committing to it.
 #
-# Override per request with ?engine=constme or ?engine=faster-whisper, so the
-# same clip can be put through both without restarting anything.
-ENGINE = "faster-whisper"
+# Set to "constme" on this branch so ordinary driving exercises it and the
+# accuracy can be judged from real use rather than six clips. faster-whisper
+# stays loaded as the fallback. Override per request with ?engine=... to put
+# the same clip through both without restarting anything.
+ENGINE = "constme"
 
 CONSTME_EXE   = os.environ.get("CONSTME_EXE", r"C:\constme\main.exe")
 # No default: which GGML model to use is a real choice (size, .en or not) and
@@ -129,6 +131,28 @@ if DENOISE and nr is None:
     print(f"Denoising OFF - could not import noisereduce: {_nr_import_error}")
     print(f"  running interpreter: {sys.executable}")
     print(f'  install into THIS interpreter: "{sys.executable}" -m pip install noisereduce')
+# A Const-me that cannot start falls back per request, which is right for
+# keeping the Pi working but means a whole week of "testing Const-me" could
+# quietly be faster-whisper. Say so at startup, where it will be noticed.
+if ENGINE == "constme":
+    problems = []
+    if not CONSTME_MODEL:
+        problems.append("CONSTME_MODEL is not set")
+    elif not os.path.exists(CONSTME_MODEL):
+        problems.append(f"model not found: {CONSTME_MODEL}")
+    if not os.path.exists(CONSTME_EXE):
+        problems.append(f"exe not found: {CONSTME_EXE}")
+    if problems:
+        print("\n*** ENGINE is 'constme' but it cannot run: ***")
+        for p in problems:
+            print(f"      {p}")
+        print("    Every request will fall back to faster-whisper, so you would")
+        print("    be testing the wrong engine. Fix before collecting results.\n")
+    else:
+        print(f"Engine: constme  ({CONSTME_EXE}, {os.path.basename(CONSTME_MODEL)})")
+else:
+    print(f"Engine: {ENGINE}")
+
 print(f"Model loaded. Denoise: {DENOISE and nr is not None}. Ready.")
 
 
